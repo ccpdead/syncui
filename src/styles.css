@@ -318,13 +318,35 @@ body {
   word-break: break-all;
 }
 
-.dbg {
-  font-family: ui-monospace, "Cascadia Code", monospace;
+.scanning {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  background: #16203a;
+  border: 1px solid var(--accent);
+  color: var(--text);
+  padding: 10px 14px;
+  border-radius: 10px;
+  font-size: 13px;
+}
+.scanning b {
+  color: var(--accent);
+}
+.scan-hint {
+  color: var(--muted);
   font-size: 12px;
-  color: #fbbf24;
-  background: #1a1407;
-  border: 1px solid #5c4a12;
-  border-radius: 8px;
-  padding: 6px 10px;
-  word-break: break-all;
+}
+.spinner {
+  width: 16px;
+  height: 16px;
+  border: 2px solid rgba(59, 130, 246, 0.3);
+  border-top-color: var(--accent);
+  border-radius: 50%;
+  animation: spin 0.7s linear infinite;
+  flex: none;
+}
+@keyframes spin {
+  to {
+    transform: rotate(360deg);
+  }
 }

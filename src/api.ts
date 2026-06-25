@@ -18,6 +18,7 @@ export interface CompareResult {
   modifiedCount: number;
   deletedCount: number;
   sameCount: number;
+  skippedCount: number;
 }
 
 export interface CompareOptions {

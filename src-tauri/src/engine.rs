@@ -112,13 +112,30 @@ fn is_ignored(rel: &str, ignore: &[String]) -> bool {
 fn scan(
     root: &Path,
     ignore: &[String],
+    progress: &mut dyn FnMut(usize),
 ) -> Result<(BTreeMap<String, FileMeta>, usize), String> {
     let mut map = BTreeMap::new();
     let mut skipped: usize = 0;
     if !root.exists() {
         return Err(format!("路径不存在: {}", root.display()));
     }
-    for entry in WalkDir::new(root).follow_links(false) {
+    // Prune ignored directories *during* the walk via filter_entry, so we
+    // never descend into (and stat every file of) huge folders like .venv,
+    // node_modules or .git. This is the single biggest scan speedup on
+    // network mounts.
+    let walker = WalkDir::new(root)
+        .follow_links(false)
+        .into_iter()
+        .filter_entry(|e| match e.path().strip_prefix(root) {
+            Ok(rel) => {
+                let rel_str = rel.to_string_lossy().replace('\\', "/");
+                !is_ignored(&rel_str, ignore)
+            }
+            Err(_) => true,
+        });
+
+    let mut seen = 0usize;
+    for entry in walker {
         let entry = match entry {
             Ok(e) => e,
             Err(_) => {
@@ -144,9 +161,6 @@ fn scan(
         };
         // Normalize separators to forward slash for cross-platform stability.
         let rel_str = rel.to_string_lossy().replace('\\', "/");
-        if is_ignored(&rel_str, ignore) {
-            continue;
-        }
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(_) => {
@@ -162,7 +176,12 @@ fn scan(
                 mtime: mtime_of(&meta),
             },
         );
+        seen += 1;
+        if seen % 256 == 0 {
+            progress(seen);
+        }
     }
+    progress(seen);
     Ok((map, skipped))
 }
 
@@ -182,9 +201,23 @@ fn hash_file(path: &Path) -> Result<String, String> {
 }
 
 /// Compare two directory trees and produce a structured diff.
+#[allow(dead_code)] // convenience wrapper, used by tests and as a stable API
 pub fn compare(local: &Path, remote: &Path, opts: &CompareOptions) -> Result<CompareResult, String> {
-    let (local_map, local_skipped) = scan(local, &opts.ignore)?;
-    let (remote_map, remote_skipped) = scan(remote, &opts.ignore)?;
+    compare_with_progress(local, remote, opts, &mut |_, _| {})
+}
+
+/// Like [`compare`], but invokes `progress(phase, count)` periodically during
+/// scanning so the UI can show live activity. `phase` is "local" or "remote".
+pub fn compare_with_progress(
+    local: &Path,
+    remote: &Path,
+    opts: &CompareOptions,
+    progress: &mut dyn FnMut(&str, usize),
+) -> Result<CompareResult, String> {
+    let (local_map, local_skipped) =
+        scan(local, &opts.ignore, &mut |n| progress("local", n))?;
+    let (remote_map, remote_skipped) =
+        scan(remote, &opts.ignore, &mut |n| progress("remote", n))?;
 
     let mut entries: Vec<DiffEntry> = Vec::new();
     let (mut new_count, mut modified_count, mut deleted_count, mut same_count) = (0, 0, 0, 0);
@@ -284,6 +317,7 @@ pub fn compare(local: &Path, remote: &Path, opts: &CompareOptions) -> Result<Com
         modified_count,
         deleted_count,
         same_count,
+        skipped_count: local_skipped + remote_skipped,
     })
 }
 
@@ -459,6 +493,26 @@ mod tests {
         .unwrap();
         assert_eq!(hashed.same_count, 1);
         assert_eq!(hashed.modified_count, 0);
+
+        fs::remove_dir_all(&local).ok();
+        fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    #[cfg(unix)]
+    fn broken_symlink_is_skipped_not_fatal() {
+        use std::os::unix::fs::symlink;
+        let local = tmp_dir("local_sym");
+        let remote = tmp_dir("remote_sym");
+
+        write(&local, "real.txt", "data");
+        // A symlink whose target does not exist (like .venv/bin/python3).
+        symlink(local.join("nonexistent-target"), local.join("broken.link")).unwrap();
+
+        // Must not error; the broken link is skipped and counted.
+        let res = compare(&local, &remote, &CompareOptions::default()).unwrap();
+        assert_eq!(res.new_count, 1, "only the real file is seen as new");
+        assert!(res.skipped_count >= 1, "broken symlink counted as skipped");
 
         fs::remove_dir_all(&local).ok();
         fs::remove_dir_all(&remote).ok();

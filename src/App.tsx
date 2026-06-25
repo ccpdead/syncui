@@ -1,7 +1,6 @@
 import { useEffect, useMemo, useRef, useState, useCallback } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
-import { invoke } from "@tauri-apps/api/core";
 import { open } from "@tauri-apps/plugin-dialog";
 import {
   compareDirs,
@@ -39,18 +38,23 @@ export default function App() {
   const [localPath, setLocalPath] = useState("");
   const [remotePath, setRemotePath] = useState("");
   const [useHash, setUseHash] = useState(false);
-  const [ignoreText, setIgnoreText] = useState(".git, node_modules, .DS_Store");
+  const [ignoreText, setIgnoreText] = useState(
+    ".git, node_modules, .venv, __pycache__, .DS_Store"
+  );
   const [includeDeletes, setIncludeDeletes] = useState(false);
 
   const [result, setResult] = useState<CompareResult | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [comparing, setComparing] = useState(false);
+  const [scanProgress, setScanProgress] = useState<{
+    phase: string;
+    count: number;
+  } | null>(null);
   const [syncing, setSyncing] = useState(false);
   const [progress, setProgress] = useState<SyncProgress | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<Side | null>(null);
-  const [dbg, setDbg] = useState<string>("(尚无拖拽事件)");
 
   const localRef = useRef<HTMLDivElement>(null);
   const remoteRef = useRef<HTMLDivElement>(null);
@@ -90,12 +94,8 @@ export default function App() {
   }, []);
 
   // Native OS file/folder drag-drop handling (Tauri intercepts these at the
-  // window level, so we hit-test the cursor position to route to a zone).
+  // window level, so we route the cursor position to the nearest drop zone).
   useEffect(() => {
-    // Emit static viewport info to the terminal once, for diagnosis.
-    invoke("debug_log", {
-      msg: `mount dpr=${window.devicePixelRatio} innerW=${window.innerWidth} innerH=${window.innerHeight}`,
-    }).catch(() => {});
     let unlisten: (() => void) | undefined;
     getCurrentWebview()
       .onDragDropEvent((event) => {
@@ -104,16 +104,6 @@ export default function App() {
           setDragOver(sideAtPosition(p.position.x, p.position.y));
         } else if (p.type === "drop") {
           const side = sideAtPosition(p.position.x, p.position.y);
-          const lr = localRef.current?.getBoundingClientRect();
-          const rr = remoteRef.current?.getBoundingClientRect();
-          const info =
-            `drop raw=(${Math.round(p.position.x)},${Math.round(
-              p.position.y
-            )}) dpr=${window.devicePixelRatio} innerW=${window.innerWidth} ` +
-            `Lc=${lr ? Math.round((lr.left + lr.right) / 2) : "?"} ` +
-            `Rc=${rr ? Math.round((rr.left + rr.right) / 2) : "?"} -> ${side}`;
-          setDbg(info);
-          invoke("debug_log", { msg: info }).catch(() => {});
           setDragOver(null);
           if (side && p.paths.length > 0) {
             const path = p.paths[0];
@@ -132,7 +122,8 @@ export default function App() {
 
   // Listen for sync progress events from the backend.
   useEffect(() => {
-    let unlisten: (() => void) | undefined;
+    let unlistenSync: (() => void) | undefined;
+    let unlistenScan: (() => void) | undefined;
     listen<SyncProgress>("sync-progress", (e) => {
       const p = e.payload;
       setProgress(p);
@@ -141,9 +132,13 @@ export default function App() {
         `${p.ok ? "✓" : "✗"} [${p.index}/${p.total}] ${verb} ${p.relPath}` +
           (p.error ? ` — ${p.error}` : "")
       );
-    }).then((fn) => (unlisten = fn));
+    }).then((fn) => (unlistenSync = fn));
+    listen<{ phase: string; count: number }>("scan-progress", (e) => {
+      setScanProgress(e.payload);
+    }).then((fn) => (unlistenScan = fn));
     return () => {
-      if (unlisten) unlisten();
+      if (unlistenSync) unlistenSync();
+      if (unlistenScan) unlistenScan();
     };
   }, [pushLog]);
 
@@ -164,6 +159,7 @@ export default function App() {
     setComparing(true);
     setResult(null);
     setSelected(new Set());
+    setScanProgress({ phase: "local", count: 0 });
     try {
       const ignore = ignoreText
         .split(",")
@@ -185,6 +181,7 @@ export default function App() {
       setError(String(e));
     } finally {
       setComparing(false);
+      setScanProgress(null);
     }
   };
 
@@ -274,11 +271,6 @@ export default function App() {
         />
       </section>
 
-      <div className="dbg">
-        DEBUG: dpr={window.devicePixelRatio} innerW={window.innerWidth} innerH=
-        {window.innerHeight} | {dbg}
-      </div>
-
       <section className="controls">
         <label className="opt">
           <input
@@ -316,6 +308,15 @@ export default function App() {
 
       {error && <div className="error">{error}</div>}
 
+      {comparing && (
+        <div className="scanning">
+          <span className="spinner" />
+          正在扫描{scanProgress?.phase === "remote" ? "远程" : "本地"}目录…
+          已发现 <b>{scanProgress?.count ?? 0}</b> 个文件
+          <span className="scan-hint">（大目录请用"忽略"过滤以加速）</span>
+        </div>
+      )}
+
       {result && (
         <section className="results">
           <div className="summary">
@@ -323,6 +324,11 @@ export default function App() {
             <Badge cls="st-mod" n={result.modifiedCount} label="修改" />
             <Badge cls="st-del" n={result.deletedCount} label="远程独有" />
             <Badge cls="st-same" n={result.sameCount} label="一致" />
+            {result.skippedCount > 0 && (
+              <span className="badge" title="符号链接 / 无法访问 / 已失效的项，已安全跳过">
+                跳过 <b>{result.skippedCount}</b>
+              </span>
+            )}
             <div className="spacer" />
             <button className="link" onClick={() => setAll(true)}>
               全选

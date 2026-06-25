@@ -2,9 +2,12 @@
 
 mod engine;
 
-use engine::{compare, copy_file_atomic, delete_file, CompareOptions, CompareResult};
+use engine::{
+    compare_with_progress, copy_file_atomic, delete_file, CompareOptions, CompareResult,
+};
 use serde::{Deserialize, Serialize};
 use std::path::Path;
+use std::time::{Duration, Instant};
 use tauri::{AppHandle, Emitter};
 
 /// A single item the UI asked to synchronize.
@@ -38,20 +41,49 @@ struct SyncResult {
     errors: Vec<String>,
 }
 
-/// Compare two directories and return a structured diff for the UI.
-#[tauri::command]
-fn debug_log(msg: String) {
-    eprintln!("[FRONTEND-DEBUG] {msg}");
+/// Progress event emitted to the frontend while scanning directories.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+struct ScanProgress {
+    /// "local" | "remote"
+    phase: String,
+    count: usize,
 }
 
+/// Compare two directories and return a structured diff for the UI.
+///
+/// Async + spawn_blocking so the heavy directory walk runs off the main
+/// thread and never freezes the WebView. Emits `scan-progress` events.
 #[tauri::command]
-fn compare_dirs(
+async fn compare_dirs(
+    app: AppHandle,
     local: String,
     remote: String,
     options: Option<CompareOptions>,
 ) -> Result<CompareResult, String> {
     let opts = options.unwrap_or_default();
-    compare(Path::new(&local), Path::new(&remote), &opts)
+    tauri::async_runtime::spawn_blocking(move || {
+        let app2 = app.clone();
+        let mut last = Instant::now();
+        let mut started = false;
+        let mut emit = move |phase: &str, count: usize| {
+            // Throttle events to ~8/sec to avoid flooding the event channel.
+            if !started || last.elapsed() >= Duration::from_millis(120) {
+                started = true;
+                last = Instant::now();
+                let _ = app2.emit(
+                    "scan-progress",
+                    ScanProgress {
+                        phase: phase.to_string(),
+                        count,
+                    },
+                );
+            }
+        };
+        compare_with_progress(Path::new(&local), Path::new(&remote), &opts, &mut emit)
+    })
+    .await
+    .map_err(|e| format!("对比任务失败: {e}"))?
 }
 
 /// Apply the selected sync items (local -> remote). Emits `sync-progress`
@@ -133,7 +165,7 @@ fn sync_entries(
 pub fn run() {
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![compare_dirs, sync_entries, debug_log])
+        .invoke_handler(tauri::generate_handler![compare_dirs, sync_entries])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }
