@@ -122,8 +122,27 @@ async fn sync_entries(
     .map_err(|e| format!("同步任务失败: {e}"))?
 }
 
+/// On Linux, WebKitGTK's DMABUF / GPU compositing path fails with certain
+/// drivers and renders a blank (white) window. The dev script exports these
+/// vars, but a packaged binary (.deb / .AppImage) launched from a desktop
+/// icon inherits no such environment, so we set them here before the WebView
+/// is created. Done as early as possible in `run()` to take effect.
+#[cfg(target_os = "linux")]
+fn apply_webkit_workarounds() {
+    // Set before any other thread spawns and before the WebView initializes.
+    if std::env::var_os("WEBKIT_DISABLE_DMABUF_RENDERER").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_DMABUF_RENDERER", "1");
+    }
+    if std::env::var_os("WEBKIT_DISABLE_COMPOSITING_MODE").is_none() {
+        std::env::set_var("WEBKIT_DISABLE_COMPOSITING_MODE", "1");
+    }
+}
+
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
+    #[cfg(target_os = "linux")]
+    apply_webkit_workarounds();
+
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
         .invoke_handler(tauri::generate_handler![compare_dirs, sync_entries])
