@@ -134,6 +134,20 @@ body {
   border-radius: 8px;
   padding: 6px 8px;
 }
+.opt select,
+.opt input[type="number"] {
+  background: var(--panel-2);
+  border: 1px solid var(--border);
+  color: var(--text);
+  border-radius: 8px;
+  padding: 5px 8px;
+}
+.opt input[type="number"] {
+  width: 56px;
+}
+.opt select:disabled {
+  opacity: 0.45;
+}
 
 /* ---- buttons ---- */
 .btn {
@@ -205,14 +219,17 @@ body {
 .badge b {
   color: var(--text);
 }
-.badge.st-new b {
+.badge.st-up b {
   color: var(--new);
 }
-.badge.st-mod b {
-  color: var(--mod);
+.badge.st-down b {
+  color: #60a5fa;
 }
 .badge.st-del b {
   color: var(--del);
+}
+.badge.st-conf b {
+  color: var(--mod);
 }
 
 .progress {
@@ -283,14 +300,17 @@ body {
   font-size: 12.5px;
   font-weight: 600;
 }
-.st-new {
+.st-up {
   color: var(--new);
 }
-.st-mod {
-  color: var(--mod);
+.st-down {
+  color: #60a5fa;
 }
 .st-del {
   color: var(--del);
+}
+.st-conf {
+  color: var(--mod);
 }
 .st-same {
   color: var(--same);

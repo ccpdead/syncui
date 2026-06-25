@@ -1,14 +1,17 @@
 //! Core directory comparison & sync engine.
 //!
 //! Works purely on filesystem paths, so it doesn't care whether a side is a
-//! local folder or a mounted remote (sftp/smb) folder — both look like plain
-//! paths to the OS.
+//! local folder or a mounted remote (sftp/smb/nfs) folder — both look like
+//! plain paths to the OS.
 
+use crate::snapshot::{SnapEntry, Snapshot};
 use serde::{Deserialize, Serialize};
-use std::collections::BTreeMap;
+use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
 use walkdir::WalkDir;
 
@@ -21,14 +24,23 @@ const MTIME_TOLERANCE_SECS: i64 = 2;
 #[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CompareOptions {
-    /// When true, files with equal size are additionally compared by content
-    /// hash. Slower but accurate (also reads the remote over the network).
+    /// When true, files with equal size but differing mtime are compared by
+    /// content hash (with snapshot-backed caching). Slower but accurate.
     #[serde(default)]
     pub use_hash: bool,
-    /// Glob-ish substrings to ignore (simple `contains` match on the relative
-    /// path). e.g. ".git", "node_modules", ".tmp".
+    /// Substrings to ignore (simple `contains` match on the relative path),
+    /// e.g. ".git", "node_modules", ".venv". Ignored directories are pruned
+    /// during the walk, so we never descend into them.
     #[serde(default)]
     pub ignore: Vec<String>,
+    /// "mirror" = one-way local -> remote. "twoway" = bidirectional using the
+    /// three-way (Local/Remote/Baseline) decision matrix.
+    #[serde(default = "default_mode")]
+    pub mode: String,
+}
+
+fn default_mode() -> String {
+    "mirror".to_string()
 }
 
 impl Default for CompareOptions {
@@ -36,27 +48,31 @@ impl Default for CompareOptions {
         CompareOptions {
             use_hash: false,
             ignore: Vec::new(),
+            mode: default_mode(),
         }
     }
 }
 
-/// A single scanned file (directories are tracked separately during sync).
 #[derive(Debug, Clone)]
 struct FileMeta {
     size: u64,
     mtime: i64,
 }
 
-/// The status of a single relative path when comparing local vs remote.
+/// The action proposed for a relative path after comparison.
 #[derive(Debug, Clone, Serialize, PartialEq)]
-#[serde(rename_all = "lowercase")]
-pub enum DiffStatus {
-    /// Exists locally but not remotely.
-    New,
-    /// Exists on both sides but differs.
-    Modified,
-    /// Exists remotely but not locally.
-    Deleted,
+#[serde(rename_all = "camelCase")]
+pub enum Action {
+    /// Copy local -> remote.
+    Upload,
+    /// Copy remote -> local.
+    Download,
+    /// Remove the local file (remote deleted it).
+    DeleteLocal,
+    /// Remove the remote file (local deleted it, or mirror cleanup).
+    DeleteRemote,
+    /// Both sides changed relative to the baseline; user must resolve.
+    Conflict,
     /// Identical on both sides.
     Same,
 }
@@ -66,12 +82,12 @@ pub enum DiffStatus {
 #[serde(rename_all = "camelCase")]
 pub struct DiffEntry {
     pub rel_path: String,
-    pub status: DiffStatus,
+    pub action: Action,
     pub local_size: Option<u64>,
     pub remote_size: Option<u64>,
     pub local_mtime: Option<i64>,
     pub remote_mtime: Option<i64>,
-    /// "local" | "remote" | null — which side is newer (for Modified rows).
+    /// "local" | "remote" | null — which side is newer.
     pub newer: Option<String>,
 }
 
@@ -80,9 +96,11 @@ pub struct DiffEntry {
 #[serde(rename_all = "camelCase")]
 pub struct CompareResult {
     pub entries: Vec<DiffEntry>,
-    pub new_count: usize,
-    pub modified_count: usize,
-    pub deleted_count: usize,
+    pub upload_count: usize,
+    pub download_count: usize,
+    pub delete_local_count: usize,
+    pub delete_remote_count: usize,
+    pub conflict_count: usize,
     pub same_count: usize,
     /// Entries skipped during scan (symlinks, broken links, unreadable files).
     pub skipped_count: usize,
@@ -97,18 +115,19 @@ fn mtime_of(meta: &fs::Metadata) -> i64 {
 }
 
 fn is_ignored(rel: &str, ignore: &[String]) -> bool {
-    ignore.iter().any(|pat| !pat.is_empty() && rel.contains(pat.as_str()))
+    ignore
+        .iter()
+        .any(|pat| !pat.is_empty() && rel.contains(pat.as_str()))
+}
+
+fn mtime_close(a: i64, b: i64) -> bool {
+    (a - b).abs() <= MTIME_TOLERANCE_SECS
 }
 
 /// Walk a directory and build a map of relative path -> file metadata.
-/// Only regular files are recorded; directories are recreated implicitly
-/// during sync from the file paths.
-///
-/// Resilient by design: individual entries that can't be read (broken
-/// symlinks on NFS/gvfs, permission errors, files that vanished mid-scan)
-/// are skipped and counted rather than aborting the whole scan. Symlinks
-/// are skipped entirely — a file sync tool copies real files, and following
-/// links on network mounts is a common source of errors.
+/// Resilient: unreadable entries (broken links on gvfs/NFS, permission
+/// errors) are skipped and counted. Symlinks are skipped entirely. Ignored
+/// directories are pruned during the walk for speed.
 fn scan(
     root: &Path,
     ignore: &[String],
@@ -119,10 +138,6 @@ fn scan(
     if !root.exists() {
         return Err(format!("路径不存在: {}", root.display()));
     }
-    // Prune ignored directories *during* the walk via filter_entry, so we
-    // never descend into (and stat every file of) huge folders like .venv,
-    // node_modules or .git. This is the single biggest scan speedup on
-    // network mounts.
     let walker = WalkDir::new(root)
         .follow_links(false)
         .into_iter()
@@ -139,13 +154,11 @@ fn scan(
         let entry = match entry {
             Ok(e) => e,
             Err(_) => {
-                // Unreadable directory entry (e.g. broken link on gvfs/NFS).
                 skipped += 1;
                 continue;
             }
         };
         let ft = entry.file_type();
-        // Skip symlinks (including broken ones) and anything not a regular file.
         if ft.is_symlink() || !ft.is_file() {
             if ft.is_symlink() {
                 skipped += 1;
@@ -159,12 +172,14 @@ fn scan(
                 continue;
             }
         };
-        // Normalize separators to forward slash for cross-platform stability.
         let rel_str = rel.to_string_lossy().replace('\\', "/");
+        // Skip our own atomic-copy leftovers (e.g. from an interrupted run).
+        if rel_str.ends_with(".synctmp") {
+            continue;
+        }
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(_) => {
-                // Couldn't stat this file; skip rather than fail the scan.
                 skipped += 1;
                 continue;
             }
@@ -200,130 +215,247 @@ fn hash_file(path: &Path) -> Result<String, String> {
     Ok(hasher.finalize().to_hex().to_string())
 }
 
-/// Compare two directory trees and produce a structured diff.
-#[allow(dead_code)] // convenience wrapper, used by tests and as a stable API
-pub fn compare(local: &Path, remote: &Path, opts: &CompareOptions) -> Result<CompareResult, String> {
-    compare_with_progress(local, remote, opts, &mut |_, _| {})
+/// Hash a file, reusing the baseline's stored hash when size+mtime match
+/// (incremental cache — avoids re-reading unchanged files over the network).
+fn hash_cached(path: &Path, meta: &FileMeta, base: Option<&SnapEntry>) -> Option<String> {
+    if let Some(b) = base {
+        if b.size == meta.size && mtime_close(b.mtime, meta.mtime) {
+            if let Some(h) = &b.hash {
+                return Some(h.clone());
+            }
+        }
+    }
+    hash_file(path).ok()
 }
 
-/// Like [`compare`], but invokes `progress(phase, count)` periodically during
-/// scanning so the UI can show live activity. `phase` is "local" or "remote".
+/// Whether the local and remote files have identical content.
+fn same_content(
+    lp: &Path,
+    l: &FileMeta,
+    rp: &Path,
+    r: &FileMeta,
+    use_hash: bool,
+    base: Option<&SnapEntry>,
+) -> bool {
+    if l.size != r.size {
+        return false;
+    }
+    if mtime_close(l.mtime, r.mtime) {
+        return true;
+    }
+    if !use_hash {
+        return false;
+    }
+    match (hash_cached(lp, l, base), hash_cached(rp, r, base)) {
+        (Some(a), Some(b)) => a == b,
+        _ => false,
+    }
+}
+
+/// Whether a file differs from the recorded baseline. No baseline => changed.
+fn changed_from_baseline(meta: &FileMeta, base: Option<&SnapEntry>) -> bool {
+    match base {
+        None => true,
+        Some(b) => !(b.size == meta.size && mtime_close(b.mtime, meta.mtime)),
+    }
+}
+
+fn newer_of(l: Option<&FileMeta>, r: Option<&FileMeta>) -> Option<String> {
+    match (l, r) {
+        (Some(l), Some(r)) => Some(if l.mtime >= r.mtime { "local" } else { "remote" }.into()),
+        (Some(_), None) => Some("local".into()),
+        (None, Some(_)) => Some("remote".into()),
+        (None, None) => None,
+    }
+}
+
+/// Convenience wrapper used by tests and as a stable API (no progress, empty
+/// baseline => behaves as a plain two-way / mirror compare).
+#[allow(dead_code)]
+pub fn compare(local: &Path, remote: &Path, opts: &CompareOptions) -> Result<CompareResult, String> {
+    compare_with_progress(local, remote, opts, &Snapshot::default(), &mut |_, _| {})
+}
+
+/// Compare two directory trees against a baseline snapshot and produce a
+/// structured diff. `progress(phase, count)` is called periodically during
+/// scanning ("local"/"remote").
 pub fn compare_with_progress(
     local: &Path,
     remote: &Path,
     opts: &CompareOptions,
+    baseline: &Snapshot,
     progress: &mut dyn FnMut(&str, usize),
 ) -> Result<CompareResult, String> {
-    let (local_map, local_skipped) =
-        scan(local, &opts.ignore, &mut |n| progress("local", n))?;
-    let (remote_map, remote_skipped) =
-        scan(remote, &opts.ignore, &mut |n| progress("remote", n))?;
+    let (local_map, local_skipped) = scan(local, &opts.ignore, &mut |n| progress("local", n))?;
+    let (remote_map, remote_skipped) = scan(remote, &opts.ignore, &mut |n| progress("remote", n))?;
+
+    let twoway = opts.mode == "twoway";
+
+    // Union of every relative path seen on either side (plus baseline in
+    // two-way mode, so deletions are detected).
+    let mut keys: BTreeSet<&String> = BTreeSet::new();
+    keys.extend(local_map.keys());
+    keys.extend(remote_map.keys());
+    if twoway {
+        keys.extend(baseline.files.keys());
+    }
 
     let mut entries: Vec<DiffEntry> = Vec::new();
-    let (mut new_count, mut modified_count, mut deleted_count, mut same_count) = (0, 0, 0, 0);
+    let mut counts = [0usize; 6]; // upload, download, delLocal, delRemote, conflict, same
 
-    for (rel, lmeta) in &local_map {
-        match remote_map.get(rel) {
-            None => {
-                new_count += 1;
-                entries.push(DiffEntry {
-                    rel_path: rel.clone(),
-                    status: DiffStatus::New,
-                    local_size: Some(lmeta.size),
-                    remote_size: None,
-                    local_mtime: Some(lmeta.mtime),
-                    remote_mtime: None,
-                    newer: Some("local".into()),
-                });
-            }
-            Some(rmeta) => {
-                let size_diff = lmeta.size != rmeta.size;
-                let mtime_diff = (lmeta.mtime - rmeta.mtime).abs() > MTIME_TOLERANCE_SECS;
+    for rel in keys {
+        let l = local_map.get(rel);
+        let r = remote_map.get(rel);
+        let b = baseline.files.get(rel);
+        let lp = local.join(rel);
+        let rp = remote.join(rel);
 
-                let mut changed = size_diff || mtime_diff;
-                // If sizes match but mtime differs, an optional hash check can
-                // confirm whether contents actually changed.
-                if changed && !size_diff && opts.use_hash {
-                    let lh = hash_file(&local.join(rel))?;
-                    let rh = hash_file(&remote.join(rel))?;
-                    changed = lh != rh;
-                }
+        let action = if twoway {
+            decide_twoway(&lp, l, &rp, r, b, opts.use_hash)
+        } else {
+            decide_mirror(&lp, l, &rp, r, opts.use_hash, b)
+        };
 
-                if changed {
-                    modified_count += 1;
-                    let newer = if lmeta.mtime >= rmeta.mtime {
-                        "local"
-                    } else {
-                        "remote"
-                    };
-                    entries.push(DiffEntry {
-                        rel_path: rel.clone(),
-                        status: DiffStatus::Modified,
-                        local_size: Some(lmeta.size),
-                        remote_size: Some(rmeta.size),
-                        local_mtime: Some(lmeta.mtime),
-                        remote_mtime: Some(rmeta.mtime),
-                        newer: Some(newer.into()),
-                    });
-                } else {
-                    same_count += 1;
-                    entries.push(DiffEntry {
-                        rel_path: rel.clone(),
-                        status: DiffStatus::Same,
-                        local_size: Some(lmeta.size),
-                        remote_size: Some(rmeta.size),
-                        local_mtime: Some(lmeta.mtime),
-                        remote_mtime: Some(rmeta.mtime),
-                        newer: None,
-                    });
-                }
-            }
+        let action = match action {
+            Some(a) => a,
+            None => continue, // nothing to do (e.g. both deleted)
+        };
+
+        match action {
+            Action::Upload => counts[0] += 1,
+            Action::Download => counts[1] += 1,
+            Action::DeleteLocal => counts[2] += 1,
+            Action::DeleteRemote => counts[3] += 1,
+            Action::Conflict => counts[4] += 1,
+            Action::Same => counts[5] += 1,
         }
+
+        entries.push(DiffEntry {
+            rel_path: rel.clone(),
+            action,
+            local_size: l.map(|m| m.size),
+            remote_size: r.map(|m| m.size),
+            local_mtime: l.map(|m| m.mtime),
+            remote_mtime: r.map(|m| m.mtime),
+            newer: newer_of(l, r),
+        });
     }
 
-    for (rel, rmeta) in &remote_map {
-        if !local_map.contains_key(rel) {
-            deleted_count += 1;
-            entries.push(DiffEntry {
-                rel_path: rel.clone(),
-                status: DiffStatus::Deleted,
-                local_size: None,
-                remote_size: Some(rmeta.size),
-                local_mtime: None,
-                remote_mtime: Some(rmeta.mtime),
-                newer: Some("remote".into()),
-            });
-        }
-    }
-
-    // Stable, human-friendly ordering: by status group, then path.
     entries.sort_by(|a, b| {
-        fn rank(s: &DiffStatus) -> u8 {
+        fn rank(s: &Action) -> u8 {
             match s {
-                DiffStatus::New => 0,
-                DiffStatus::Modified => 1,
-                DiffStatus::Deleted => 2,
-                DiffStatus::Same => 3,
+                Action::Upload => 0,
+                Action::Download => 1,
+                Action::DeleteRemote => 2,
+                Action::DeleteLocal => 3,
+                Action::Conflict => 4,
+                Action::Same => 5,
             }
         }
-        rank(&a.status)
-            .cmp(&rank(&b.status))
+        rank(&a.action)
+            .cmp(&rank(&b.action))
             .then_with(|| a.rel_path.cmp(&b.rel_path))
     });
 
     Ok(CompareResult {
         entries,
-        new_count,
-        modified_count,
-        deleted_count,
-        same_count,
+        upload_count: counts[0],
+        download_count: counts[1],
+        delete_local_count: counts[2],
+        delete_remote_count: counts[3],
+        conflict_count: counts[4],
+        same_count: counts[5],
         skipped_count: local_skipped + remote_skipped,
     })
 }
 
-/// Copy a single file local->remote atomically: write to a temp file in the
-/// destination directory, fsync-rename into place, then mirror the source
-/// mtime so subsequent comparisons stay idempotent.
+/// One-way mirror decision (make remote match local).
+fn decide_mirror(
+    lp: &Path,
+    l: Option<&FileMeta>,
+    rp: &Path,
+    r: Option<&FileMeta>,
+    use_hash: bool,
+    base: Option<&SnapEntry>,
+) -> Option<Action> {
+    match (l, r) {
+        (Some(l), Some(r)) => {
+            if same_content(lp, l, rp, r, use_hash, base) {
+                Some(Action::Same)
+            } else {
+                Some(Action::Upload)
+            }
+        }
+        (Some(_), None) => Some(Action::Upload),
+        (None, Some(_)) => Some(Action::DeleteRemote), // remote extra
+        (None, None) => None,
+    }
+}
+
+/// Three-way (Local/Remote/Baseline) decision matrix for bidirectional sync.
+fn decide_twoway(
+    lp: &Path,
+    l: Option<&FileMeta>,
+    rp: &Path,
+    r: Option<&FileMeta>,
+    b: Option<&SnapEntry>,
+    use_hash: bool,
+) -> Option<Action> {
+    match (l, r) {
+        (Some(l), Some(r)) => {
+            if same_content(lp, l, rp, r, use_hash, b) {
+                return Some(Action::Same);
+            }
+            let lc = changed_from_baseline(l, b);
+            let rc = changed_from_baseline(r, b);
+            match (lc, rc) {
+                (true, false) => Some(Action::Upload),
+                (false, true) => Some(Action::Download),
+                _ => Some(Action::Conflict),
+            }
+        }
+        (Some(l), None) => match b {
+            None => Some(Action::Upload), // new local file
+            Some(_) => {
+                if changed_from_baseline(l, b) {
+                    Some(Action::Conflict) // modified locally, deleted remotely
+                } else {
+                    Some(Action::DeleteLocal) // remote deletion to propagate
+                }
+            }
+        },
+        (None, Some(r)) => match b {
+            None => Some(Action::Download), // new remote file
+            Some(_) => {
+                if changed_from_baseline(r, b) {
+                    Some(Action::Conflict) // modified remotely, deleted locally
+                } else {
+                    Some(Action::DeleteRemote) // local deletion to propagate
+                }
+            }
+        },
+        (None, None) => None, // both gone; baseline is stale
+    }
+}
+
+/// Set a destination file's mtime to match the source (best-effort).
+fn mirror_mtime(src: &Path, dst: &Path) {
+    if let Ok(meta) = fs::metadata(src) {
+        if let Ok(mtime) = meta.modified() {
+            let ft = filetime::FileTime::from_system_time(mtime);
+            let _ = filetime::set_file_mtime(dst, ft);
+        }
+    }
+}
+
+/// Copy a single file to `dst`, preserving the source mtime so subsequent
+/// comparisons stay idempotent.
+///
+/// Prefers an atomic temp-file + rename (avoids half-written files). But some
+/// network mounts — notably gvfs (sftp/nfs) FUSE backends — implement `rename`
+/// unreliably and return ENOENT even when the temp file exists. In that case
+/// we fall back to a direct copy onto the destination, which works wherever
+/// writing the temp file worked.
 pub fn copy_file_atomic(src: &Path, dst: &Path) -> Result<(), String> {
     if let Some(parent) = dst.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
@@ -332,39 +464,231 @@ pub fn copy_file_atomic(src: &Path, dst: &Path) -> Result<(), String> {
         let mut p = dst.to_path_buf();
         let name = format!(
             ".{}.synctmp",
-            dst.file_name().map(|n| n.to_string_lossy().to_string()).unwrap_or_default()
+            dst.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
         );
         p.set_file_name(name);
         p
     };
 
     fs::copy(src, &tmp).map_err(|e| format!("复制失败: {e}"))?;
+    mirror_mtime(src, &tmp);
 
-    // Preserve source mtime on the temp file before renaming.
-    if let Ok(meta) = fs::metadata(src) {
-        if let Ok(mtime) = meta.modified() {
-            let ft = filetime::FileTime::from_system_time(mtime);
-            let _ = filetime::set_file_mtime(&tmp, ft);
+    match fs::rename(&tmp, dst) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            // Fallback for mounts where rename is unreliable (gvfs/NFS).
+            let direct = fs::copy(src, dst)
+                .map(|_| ())
+                .map_err(|e| format!("复制失败: {e}"));
+            let _ = fs::remove_file(&tmp);
+            if direct.is_ok() {
+                mirror_mtime(src, dst);
+            }
+            direct
         }
     }
-
-    fs::rename(&tmp, dst).map_err(|e| {
-        let _ = fs::remove_file(&tmp);
-        format!("重命名失败: {e}")
-    })?;
-    Ok(())
 }
 
-/// Delete a file (used for "deleted" entries when the user opts in).
+/// Delete a file (used for delete actions when the user opts in).
 pub fn delete_file(path: &Path) -> Result<(), String> {
     fs::remove_file(path).map_err(|e| format!("删除失败: {e}"))
+}
+
+// ----------------------------- sync execution -----------------------------
+
+/// A concrete operation the UI asked to perform.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncOp {
+    pub rel_path: String,
+    /// "upload" | "download" | "delLocal" | "delRemote"
+    pub op: String,
+}
+
+/// Progress emitted per operation during a sync run.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct OpProgress {
+    pub index: usize,
+    pub total: usize,
+    pub rel_path: String,
+    pub op: String,
+    pub ok: bool,
+    pub skipped: bool,
+    pub error: Option<String>,
+}
+
+/// Summary returned when a sync run completes.
+#[derive(Debug, Clone, Serialize, Default)]
+#[serde(rename_all = "camelCase")]
+pub struct SyncResult {
+    pub uploaded: usize,
+    pub downloaded: usize,
+    pub deleted_local: usize,
+    pub deleted_remote: usize,
+    /// Items whose file vanished between compare and sync (raced away).
+    pub skipped: usize,
+    pub failed: usize,
+    pub errors: Vec<String>,
+}
+
+/// Outcome of a single op: either performed, or skipped because the file
+/// disappeared between comparison and execution (a benign race).
+enum OpOutcome {
+    Done,
+    Skipped,
+}
+
+fn exec_op(local: &Path, remote: &Path, op: &SyncOp) -> Result<OpOutcome, String> {
+    let lp = local.join(&op.rel_path);
+    let rp = remote.join(&op.rel_path);
+    match op.op.as_str() {
+        "upload" => {
+            if !lp.exists() {
+                return Ok(OpOutcome::Skipped);
+            }
+            match copy_file_atomic(&lp, &rp) {
+                Ok(_) => Ok(OpOutcome::Done),
+                // If it failed because the source raced away, skip quietly.
+                Err(e) if !lp.exists() => {
+                    let _ = e;
+                    Ok(OpOutcome::Skipped)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "download" => {
+            if !rp.exists() {
+                return Ok(OpOutcome::Skipped);
+            }
+            match copy_file_atomic(&rp, &lp) {
+                Ok(_) => Ok(OpOutcome::Done),
+                Err(e) if !rp.exists() => {
+                    let _ = e;
+                    Ok(OpOutcome::Skipped)
+                }
+                Err(e) => Err(e),
+            }
+        }
+        "delLocal" => {
+            if !lp.exists() {
+                return Ok(OpOutcome::Skipped); // already gone == success
+            }
+            delete_file(&lp).map(|_| OpOutcome::Done)
+        }
+        "delRemote" => {
+            if !rp.exists() {
+                return Ok(OpOutcome::Skipped);
+            }
+            delete_file(&rp).map(|_| OpOutcome::Done)
+        }
+        other => Err(format!("未知操作: {other}")),
+    }
+}
+
+/// Apply operations in parallel with a bounded worker pool. `progress` is
+/// invoked (from worker threads) as each op completes.
+pub fn apply_ops(
+    local: &Path,
+    remote: &Path,
+    ops: &[SyncOp],
+    concurrency: usize,
+    progress: &(dyn Fn(OpProgress) + Sync),
+) -> SyncResult {
+    let total = ops.len();
+    let next = AtomicUsize::new(0);
+    let done = AtomicUsize::new(0);
+    let res = Mutex::new(SyncResult::default());
+    let workers = concurrency.clamp(1, 32);
+
+    std::thread::scope(|s| {
+        for _ in 0..workers {
+            s.spawn(|| loop {
+                let i = next.fetch_add(1, Ordering::Relaxed);
+                if i >= total {
+                    break;
+                }
+                let op = &ops[i];
+                let result = exec_op(local, remote, op);
+                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                let (ok, skipped, err) = match &result {
+                    Ok(OpOutcome::Done) => {
+                        let mut g = res.lock().unwrap();
+                        match op.op.as_str() {
+                            "upload" => g.uploaded += 1,
+                            "download" => g.downloaded += 1,
+                            "delLocal" => g.deleted_local += 1,
+                            "delRemote" => g.deleted_remote += 1,
+                            _ => {}
+                        }
+                        (true, false, None)
+                    }
+                    Ok(OpOutcome::Skipped) => {
+                        let mut g = res.lock().unwrap();
+                        g.skipped += 1;
+                        (true, true, None)
+                    }
+                    Err(e) => {
+                        let mut g = res.lock().unwrap();
+                        g.failed += 1;
+                        g.errors.push(format!("{}: {}", op.rel_path, e));
+                        (false, false, Some(e.clone()))
+                    }
+                };
+                progress(OpProgress {
+                    index: d,
+                    total,
+                    rel_path: op.rel_path.clone(),
+                    op: op.op.clone(),
+                    ok,
+                    skipped,
+                    error: err,
+                });
+            });
+        }
+    });
+
+    res.into_inner().unwrap()
+}
+
+/// Rebuild a baseline snapshot from the *current* state of both sides: record
+/// every file that is now equal on both sides. Used after a sync completes so
+/// the next comparison has an accurate baseline.
+pub fn build_snapshot(local: &Path, remote: &Path, ignore: &[String]) -> Snapshot {
+    let mut noop = |_: usize| {};
+    let local_map = scan(local, ignore, &mut noop)
+        .map(|(m, _)| m)
+        .unwrap_or_default();
+    let remote_map = scan(remote, ignore, &mut noop)
+        .map(|(m, _)| m)
+        .unwrap_or_default();
+
+    let mut snap = Snapshot::default();
+    for (rel, lm) in &local_map {
+        if let Some(rm) = remote_map.get(rel) {
+            if lm.size == rm.size && mtime_close(lm.mtime, rm.mtime) {
+                snap.files.insert(
+                    rel.clone(),
+                    SnapEntry {
+                        size: lm.size,
+                        mtime: lm.mtime,
+                        hash: None,
+                    },
+                );
+            }
+        }
+    }
+    snap
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::snapshot::Snapshot;
     use std::fs;
-    use std::time::{SystemTime, Duration};
+    use std::time::{Duration, SystemTime};
 
     fn tmp_dir(tag: &str) -> PathBuf {
         let mut p = std::env::temp_dir();
@@ -389,110 +713,132 @@ mod tests {
         fs::write(p, content).unwrap();
     }
 
-    #[test]
-    fn detects_new_modified_deleted_same() {
-        let local = tmp_dir("local");
-        let remote = tmp_dir("remote");
+    fn opts(mode: &str) -> CompareOptions {
+        CompareOptions {
+            use_hash: false,
+            ignore: vec![],
+            mode: mode.to_string(),
+        }
+    }
 
-        // same on both
+    fn find<'a>(res: &'a CompareResult, rel: &str) -> &'a DiffEntry {
+        res.entries.iter().find(|e| e.rel_path == rel).unwrap()
+    }
+
+    #[test]
+    fn mirror_detects_upload_and_delete_remote() {
+        let local = tmp_dir("m_local");
+        let remote = tmp_dir("m_remote");
         write(&local, "same.txt", "hello");
         write(&remote, "same.txt", "hello");
-        // new (local only)
-        write(&local, "sub/new.txt", "fresh");
-        // modified (different size)
-        write(&local, "mod.txt", "longer content here");
-        write(&remote, "mod.txt", "short");
-        // deleted (remote only)
-        write(&remote, "gone.txt", "old");
+        write(&local, "new.txt", "fresh"); // upload
+        write(&local, "mod.txt", "longer content");
+        write(&remote, "mod.txt", "short"); // upload (overwrite)
+        write(&remote, "extra.txt", "old"); // remote-only -> delete remote
 
-        let opts = CompareOptions::default();
-        let res = compare(&local, &remote, &opts).unwrap();
-
-        assert_eq!(res.new_count, 1, "new");
-        assert_eq!(res.modified_count, 1, "modified");
-        assert_eq!(res.deleted_count, 1, "deleted");
-        assert_eq!(res.same_count, 1, "same");
-
-        fs::remove_dir_all(&local).ok();
-        fs::remove_dir_all(&remote).ok();
-    }
-
-    #[test]
-    fn ignore_filter_excludes_paths() {
-        let local = tmp_dir("local_ig");
-        let remote = tmp_dir("remote_ig");
-        write(&local, ".git/config", "x");
-        write(&local, "keep.txt", "y");
-
-        let opts = CompareOptions {
-            use_hash: false,
-            ignore: vec![".git".to_string()],
-        };
-        let res = compare(&local, &remote, &opts).unwrap();
-        // only keep.txt should be seen as new; .git/config ignored
-        assert_eq!(res.new_count, 1);
-
-        fs::remove_dir_all(&local).ok();
-        fs::remove_dir_all(&remote).ok();
-    }
-
-    #[test]
-    fn atomic_copy_preserves_content_and_mtime() {
-        let local = tmp_dir("local_cp");
-        let remote = tmp_dir("remote_cp");
-        write(&local, "a/b/file.txt", "payload-123");
-
-        // set a known mtime in the past on the source
-        let past = SystemTime::now() - Duration::from_secs(10_000);
-        let ft = filetime::FileTime::from_system_time(past);
-        filetime::set_file_mtime(local.join("a/b/file.txt"), ft).unwrap();
-
-        let src = local.join("a/b/file.txt");
-        let dst = remote.join("a/b/file.txt");
-        copy_file_atomic(&src, &dst).unwrap();
-
-        assert_eq!(fs::read_to_string(&dst).unwrap(), "payload-123");
-
-        let s_m = mtime_of(&fs::metadata(&src).unwrap());
-        let d_m = mtime_of(&fs::metadata(&dst).unwrap());
-        assert!((s_m - d_m).abs() <= MTIME_TOLERANCE_SECS, "mtime preserved");
-
-        // After copy, a compare should report this file as Same (idempotent).
-        let res = compare(&local, &remote, &CompareOptions::default()).unwrap();
+        let res = compare(&local, &remote, &opts("mirror")).unwrap();
+        assert_eq!(res.upload_count, 2);
+        assert_eq!(res.delete_remote_count, 1);
         assert_eq!(res.same_count, 1);
-        assert_eq!(res.new_count, 0);
-        assert_eq!(res.modified_count, 0);
+        assert_eq!(find(&res, "new.txt").action, Action::Upload);
+        assert_eq!(find(&res, "extra.txt").action, Action::DeleteRemote);
 
         fs::remove_dir_all(&local).ok();
         fs::remove_dir_all(&remote).ok();
     }
 
     #[test]
-    fn hash_mode_treats_touched_but_identical_as_same() {
-        let local = tmp_dir("local_h");
-        let remote = tmp_dir("remote_h");
-        write(&local, "f.txt", "identical");
-        write(&remote, "f.txt", "identical");
+    fn twoway_distinguishes_delete_from_new() {
+        let local = tmp_dir("t_local");
+        let remote = tmp_dir("t_remote");
 
-        // Make mtimes differ beyond tolerance but contents identical.
-        let ft_old = filetime::FileTime::from_system_time(
-            SystemTime::now() - Duration::from_secs(50_000),
+        // Baseline says both had "shared.txt" and "gone.txt".
+        write(&local, "shared.txt", "v1");
+        write(&remote, "shared.txt", "v1");
+        // "gone.txt" existed at baseline on both, but local deleted it.
+        write(&remote, "gone.txt", "old");
+        // A brand new remote file with no baseline -> should download.
+        write(&remote, "fromremote.txt", "remote new");
+
+        let mut base = Snapshot::default();
+        for (rel, content) in [("shared.txt", "v1"), ("gone.txt", "old")] {
+            let m = fs::metadata(remote.join(rel)).unwrap();
+            base.files.insert(
+                rel.to_string(),
+                SnapEntry {
+                    size: content.len() as u64,
+                    mtime: mtime_of(&m),
+                    hash: None,
+                },
+            );
+        }
+
+        let res =
+            compare_with_progress(&local, &remote, &opts("twoway"), &base, &mut |_, _| {}).unwrap();
+
+        // local-deleted + remote-unchanged baseline file -> delete remote
+        assert_eq!(find(&res, "gone.txt").action, Action::DeleteRemote);
+        // remote-only with no baseline -> download (a new file, not a deletion)
+        assert_eq!(find(&res, "fromremote.txt").action, Action::Download);
+
+        fs::remove_dir_all(&local).ok();
+        fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    fn twoway_flags_conflict_when_both_changed() {
+        let local = tmp_dir("c_local");
+        let remote = tmp_dir("c_remote");
+        write(&local, "f.txt", "local edit longer");
+        write(&remote, "f.txt", "remote edit");
+
+        // Baseline differs from both current versions.
+        let mut base = Snapshot::default();
+        base.files.insert(
+            "f.txt".to_string(),
+            SnapEntry {
+                size: 4,
+                mtime: 0,
+                hash: None,
+            },
         );
-        filetime::set_file_mtime(remote.join("f.txt"), ft_old).unwrap();
 
-        // Without hash: counts as modified due to mtime diff.
-        let plain = compare(&local, &remote, &CompareOptions::default()).unwrap();
-        assert_eq!(plain.modified_count, 1);
+        let res =
+            compare_with_progress(&local, &remote, &opts("twoway"), &base, &mut |_, _| {}).unwrap();
+        assert_eq!(find(&res, "f.txt").action, Action::Conflict);
 
-        // With hash: identical content -> Same.
-        let hashed = compare(
-            &local,
-            &remote,
-            &CompareOptions { use_hash: true, ignore: vec![] },
-        )
-        .unwrap();
-        assert_eq!(hashed.same_count, 1);
-        assert_eq!(hashed.modified_count, 0);
+        fs::remove_dir_all(&local).ok();
+        fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    fn apply_ops_uploads_downloads_and_builds_snapshot() {
+        let local = tmp_dir("a_local");
+        let remote = tmp_dir("a_remote");
+        write(&local, "up/a.txt", "to upload");
+        write(&remote, "down/b.txt", "to download");
+
+        let ops = vec![
+            SyncOp {
+                rel_path: "up/a.txt".into(),
+                op: "upload".into(),
+            },
+            SyncOp {
+                rel_path: "down/b.txt".into(),
+                op: "download".into(),
+            },
+        ];
+        let res = apply_ops(&local, &remote, &ops, 4, &|_p| {});
+        assert_eq!(res.uploaded, 1);
+        assert_eq!(res.downloaded, 1);
+        assert_eq!(res.failed, 0);
+        assert_eq!(fs::read_to_string(remote.join("up/a.txt")).unwrap(), "to upload");
+        assert_eq!(fs::read_to_string(local.join("down/b.txt")).unwrap(), "to download");
+
+        // After sync both sides match; snapshot should record both files.
+        let snap = build_snapshot(&local, &remote, &[]);
+        assert!(snap.files.contains_key("up/a.txt"));
+        assert!(snap.files.contains_key("down/b.txt"));
 
         fs::remove_dir_all(&local).ok();
         fs::remove_dir_all(&remote).ok();
@@ -502,17 +848,57 @@ mod tests {
     #[cfg(unix)]
     fn broken_symlink_is_skipped_not_fatal() {
         use std::os::unix::fs::symlink;
-        let local = tmp_dir("local_sym");
-        let remote = tmp_dir("remote_sym");
-
+        let local = tmp_dir("s_local");
+        let remote = tmp_dir("s_remote");
         write(&local, "real.txt", "data");
-        // A symlink whose target does not exist (like .venv/bin/python3).
         symlink(local.join("nonexistent-target"), local.join("broken.link")).unwrap();
 
-        // Must not error; the broken link is skipped and counted.
-        let res = compare(&local, &remote, &CompareOptions::default()).unwrap();
-        assert_eq!(res.new_count, 1, "only the real file is seen as new");
+        let res = compare(&local, &remote, &opts("mirror")).unwrap();
+        assert_eq!(res.upload_count, 1, "only the real file uploads");
         assert!(res.skipped_count >= 1, "broken symlink counted as skipped");
+
+        fs::remove_dir_all(&local).ok();
+        fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    fn atomic_copy_preserves_mtime_idempotent() {
+        let local = tmp_dir("i_local");
+        let remote = tmp_dir("i_remote");
+        write(&local, "a/b/file.txt", "payload-123");
+
+        let past = SystemTime::now() - Duration::from_secs(10_000);
+        let ft = filetime::FileTime::from_system_time(past);
+        filetime::set_file_mtime(local.join("a/b/file.txt"), ft).unwrap();
+
+        copy_file_atomic(&local.join("a/b/file.txt"), &remote.join("a/b/file.txt")).unwrap();
+        assert_eq!(
+            fs::read_to_string(remote.join("a/b/file.txt")).unwrap(),
+            "payload-123"
+        );
+
+        // Re-compare in mirror mode: should be Same (idempotent).
+        let res = compare(&local, &remote, &opts("mirror")).unwrap();
+        assert_eq!(res.same_count, 1);
+        assert_eq!(res.upload_count, 0);
+
+        fs::remove_dir_all(&local).ok();
+        fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    fn apply_ops_skips_vanished_source() {
+        let local = tmp_dir("v_local");
+        let remote = tmp_dir("v_remote");
+        // op references a file that does not exist (raced away before sync).
+        let ops = vec![SyncOp {
+            rel_path: "ghost.txt".into(),
+            op: "upload".into(),
+        }];
+        let res = apply_ops(&local, &remote, &ops, 2, &|_p| {});
+        assert_eq!(res.uploaded, 0);
+        assert_eq!(res.failed, 0);
+        assert_eq!(res.skipped, 1);
 
         fs::remove_dir_all(&local).ok();
         fs::remove_dir_all(&remote).ok();

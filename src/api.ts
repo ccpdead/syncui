@@ -1,10 +1,20 @@
 import { invoke } from "@tauri-apps/api/core";
 
-export type DiffStatus = "new" | "modified" | "deleted" | "same";
+export type Action =
+  | "upload"
+  | "download"
+  | "deleteLocal"
+  | "deleteRemote"
+  | "conflict"
+  | "same";
+
+export type SyncMode = "mirror" | "twoway";
+
+export type ConflictPolicy = "newer" | "local" | "remote" | "skip";
 
 export interface DiffEntry {
   relPath: string;
-  status: DiffStatus;
+  action: Action;
   localSize: number | null;
   remoteSize: number | null;
   localMtime: number | null;
@@ -14,9 +24,11 @@ export interface DiffEntry {
 
 export interface CompareResult {
   entries: DiffEntry[];
-  newCount: number;
-  modifiedCount: number;
-  deletedCount: number;
+  uploadCount: number;
+  downloadCount: number;
+  deleteLocalCount: number;
+  deleteRemoteCount: number;
+  conflictCount: number;
   sameCount: number;
   skippedCount: number;
 }
@@ -24,25 +36,33 @@ export interface CompareResult {
 export interface CompareOptions {
   useHash: boolean;
   ignore: string[];
+  mode: SyncMode;
 }
 
-export interface SyncItem {
+/** A concrete operation sent to the backend. */
+export type Op = "upload" | "download" | "delLocal" | "delRemote";
+
+export interface SyncOp {
   relPath: string;
-  status: DiffStatus;
+  op: Op;
 }
 
 export interface SyncProgress {
   index: number;
   total: number;
   relPath: string;
-  action: string;
+  op: string;
   ok: boolean;
+  skipped: boolean;
   error: string | null;
 }
 
 export interface SyncResult {
-  copied: number;
-  deleted: number;
+  uploaded: number;
+  downloaded: number;
+  deletedLocal: number;
+  deletedRemote: number;
+  skipped: number;
   failed: number;
   errors: string[];
 }
@@ -58,13 +78,15 @@ export function compareDirs(
 export function syncEntries(
   local: string,
   remote: string,
-  items: SyncItem[],
-  includeDeletes: boolean
+  items: SyncOp[],
+  ignore: string[],
+  concurrency: number
 ): Promise<SyncResult> {
   return invoke<SyncResult>("sync_entries", {
     local,
     remote,
     items,
-    includeDeletes,
+    ignore,
+    concurrency,
   });
 }

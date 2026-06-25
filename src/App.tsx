@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState, useCallback } from "react";
+import { useEffect, useMemo, useRef, useState, useCallback, forwardRef } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
 import { open } from "@tauri-apps/plugin-dialog";
@@ -8,17 +8,20 @@ import {
   CompareResult,
   DiffEntry,
   SyncProgress,
+  Action,
+  Op,
+  SyncMode,
+  ConflictPolicy,
 } from "./api";
 
 type Side = "local" | "remote";
 
-const STATUS_META: Record<
-  string,
-  { label: string; icon: string; cls: string }
-> = {
-  new: { label: "新增", icon: "✚", cls: "st-new" },
-  modified: { label: "已修改", icon: "✎", cls: "st-mod" },
-  deleted: { label: "远程独有", icon: "−", cls: "st-del" },
+const ACTION_META: Record<Action, { label: string; icon: string; cls: string }> = {
+  upload: { label: "上传", icon: "↑", cls: "st-up" },
+  download: { label: "下载", icon: "↓", cls: "st-down" },
+  deleteRemote: { label: "删远程", icon: "✗", cls: "st-del" },
+  deleteLocal: { label: "删本地", icon: "✗", cls: "st-del" },
+  conflict: { label: "冲突", icon: "⚠", cls: "st-conf" },
   same: { label: "一致", icon: "=", cls: "st-same" },
 };
 
@@ -34,22 +37,45 @@ function fmtSize(n: number | null): string {
   return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)}${units[i]}`;
 }
 
+/** Resolve a diff entry + conflict policy into a concrete backend op. */
+function entryToOp(e: DiffEntry, policy: ConflictPolicy): Op | null {
+  switch (e.action) {
+    case "upload":
+      return "upload";
+    case "download":
+      return "download";
+    case "deleteLocal":
+      return "delLocal";
+    case "deleteRemote":
+      return "delRemote";
+    case "conflict":
+      if (policy === "local") return "upload";
+      if (policy === "remote") return "download";
+      if (policy === "skip") return null;
+      // "newer"
+      return (e.localMtime ?? 0) >= (e.remoteMtime ?? 0) ? "upload" : "download";
+    default:
+      return null;
+  }
+}
+
 export default function App() {
   const [localPath, setLocalPath] = useState("");
   const [remotePath, setRemotePath] = useState("");
+  const [mode, setMode] = useState<SyncMode>("mirror");
+  const [conflictPolicy, setConflictPolicy] = useState<ConflictPolicy>("newer");
   const [useHash, setUseHash] = useState(false);
+  const [concurrency, setConcurrency] = useState(4);
   const [ignoreText, setIgnoreText] = useState(
-    ".git, node_modules, .venv, __pycache__, .DS_Store"
+    ".git, node_modules, .venv, __pycache__, target, dist, .DS_Store"
   );
-  const [includeDeletes, setIncludeDeletes] = useState(false);
 
   const [result, setResult] = useState<CompareResult | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [comparing, setComparing] = useState(false);
-  const [scanProgress, setScanProgress] = useState<{
-    phase: string;
-    count: number;
-  } | null>(null);
+  const [scanProgress, setScanProgress] = useState<{ phase: string; count: number } | null>(
+    null
+  );
   const [syncing, setSyncing] = useState(false);
   const [progress, setProgress] = useState<SyncProgress | null>(null);
   const [log, setLog] = useState<string[]>([]);
@@ -63,13 +89,13 @@ export default function App() {
     setLog((prev) => [...prev.slice(-300), line]);
   }, []);
 
-  // Route a drop position to the nearest drop zone.
-  //
-  // Tauri's drag-drop position is documented as physical pixels, but on this
-  // Linux/WebKitGTK stack it actually arrives in *logical* (CSS) pixels.
-  // getBoundingClientRect() is also logical, so we compare directly. As a
-  // defensive measure for platforms that genuinely report physical pixels
-  // (values exceeding the logical viewport), we scale those down by dpr.
+  const ignoreList = useMemo(
+    () => ignoreText.split(",").map((s) => s.trim()).filter(Boolean),
+    [ignoreText]
+  );
+
+  // Route a drop position to the nearest drop zone (Tauri reports logical px
+  // on this stack; defensively scale down if a platform reports physical px).
   const sideAtPosition = useCallback((x: number, y: number): Side | null => {
     const dpr = window.devicePixelRatio || 1;
     let cx = x;
@@ -85,16 +111,11 @@ export default function App() {
     };
     const lc = center(localRef.current);
     const rc = center(remoteRef.current);
-    if (!lc || !rc) {
-      return cx < window.innerWidth / 2 ? "local" : "remote";
-    }
-    const dist = (c: { x: number; y: number }) =>
-      Math.hypot(cx - c.x, cy - c.y);
+    if (!lc || !rc) return cx < window.innerWidth / 2 ? "local" : "remote";
+    const dist = (c: { x: number; y: number }) => Math.hypot(cx - c.x, cy - c.y);
     return dist(lc) <= dist(rc) ? "local" : "remote";
   }, []);
 
-  // Native OS file/folder drag-drop handling (Tauri intercepts these at the
-  // window level, so we route the cursor position to the nearest drop zone).
   useEffect(() => {
     let unlisten: (() => void) | undefined;
     getCurrentWebview()
@@ -106,9 +127,8 @@ export default function App() {
           const side = sideAtPosition(p.position.x, p.position.y);
           setDragOver(null);
           if (side && p.paths.length > 0) {
-            const path = p.paths[0];
-            if (side === "local") setLocalPath(path);
-            else setRemotePath(path);
+            if (side === "local") setLocalPath(p.paths[0]);
+            else setRemotePath(p.paths[0]);
           }
         } else {
           setDragOver(null);
@@ -120,18 +140,21 @@ export default function App() {
     };
   }, [sideAtPosition]);
 
-  // Listen for sync progress events from the backend.
   useEffect(() => {
     let unlistenSync: (() => void) | undefined;
     let unlistenScan: (() => void) | undefined;
     listen<SyncProgress>("sync-progress", (e) => {
       const p = e.payload;
       setProgress(p);
-      const verb = p.action === "delete" ? "删除" : "复制";
-      pushLog(
-        `${p.ok ? "✓" : "✗"} [${p.index}/${p.total}] ${verb} ${p.relPath}` +
-          (p.error ? ` — ${p.error}` : "")
-      );
+      const verb =
+        p.op === "delLocal" || p.op === "delRemote"
+          ? "删除"
+          : p.op === "download"
+          ? "下载"
+          : "上传";
+      const mark = p.skipped ? "⊘" : p.ok ? "✓" : "✗";
+      const tail = p.skipped ? " — 已跳过(文件已变动)" : p.error ? ` — ${p.error}` : "";
+      pushLog(`${mark} [${p.index}/${p.total}] ${verb} ${p.relPath}${tail}`);
     }).then((fn) => (unlistenSync = fn));
     listen<{ phase: string; count: number }>("scan-progress", (e) => {
       setScanProgress(e.payload);
@@ -161,21 +184,24 @@ export default function App() {
     setSelected(new Set());
     setScanProgress({ phase: "local", count: 0 });
     try {
-      const ignore = ignoreText
-        .split(",")
-        .map((s) => s.trim())
-        .filter(Boolean);
-      const res = await compareDirs(localPath, remotePath, { useHash, ignore });
+      const res = await compareDirs(localPath, remotePath, {
+        useHash,
+        ignore: ignoreList,
+        mode,
+      });
       setResult(res);
-      // Pre-select everything that represents a change (not "same").
+      // Preselect only the safe additive ops (upload/download); deletes and
+      // conflicts require explicit opt-in.
       const preset = new Set(
         res.entries
-          .filter((e) => e.status !== "same")
+          .filter((e) => e.action === "upload" || e.action === "download")
           .map((e) => e.relPath)
       );
       setSelected(preset);
       pushLog(
-        `对比完成：新增 ${res.newCount} · 修改 ${res.modifiedCount} · 远程独有 ${res.deletedCount} · 一致 ${res.sameCount}`
+        `对比完成(${mode === "twoway" ? "双向" : "镜像"})：↑${res.uploadCount} ↓${res.downloadCount} ` +
+          `删远程${res.deleteRemoteCount} 删本地${res.deleteLocalCount} 冲突${res.conflictCount} 一致${res.sameCount}` +
+          (res.skippedCount ? ` 跳过${res.skippedCount}` : "")
       );
     } catch (e) {
       setError(String(e));
@@ -195,7 +221,7 @@ export default function App() {
   };
 
   const changedEntries = useMemo(
-    () => (result ? result.entries.filter((e) => e.status !== "same") : []),
+    () => (result ? result.entries.filter((e) => e.action !== "same") : []),
     [result]
   );
 
@@ -204,24 +230,30 @@ export default function App() {
     else setSelected(new Set());
   };
 
+  const selectedCount = useMemo(
+    () => changedEntries.filter((e) => selected.has(e.relPath)).length,
+    [changedEntries, selected]
+  );
+
   const runSync = async () => {
     if (!result) return;
     const items = changedEntries
       .filter((e) => selected.has(e.relPath))
-      .map((e) => ({ relPath: e.relPath, status: e.status }));
+      .map((e) => ({ relPath: e.relPath, op: entryToOp(e, conflictPolicy) }))
+      .filter((x): x is { relPath: string; op: Op } => x.op !== null);
     if (items.length === 0) {
-      setError("没有选中任何待同步项。");
+      setError("没有可执行的同步项（冲突可能被策略跳过）。");
       return;
     }
     setError(null);
     setSyncing(true);
     setProgress(null);
     try {
-      const res = await syncEntries(localPath, remotePath, items, includeDeletes);
+      const res = await syncEntries(localPath, remotePath, items, ignoreList, concurrency);
       pushLog(
-        `同步结束：复制 ${res.copied} · 删除 ${res.deleted} · 失败 ${res.failed}`
+        `同步结束：↑${res.uploaded} ↓${res.downloaded} 删远程${res.deletedRemote} ` +
+          `删本地${res.deletedLocal} 跳过${res.skipped} 失败${res.failed}`
       );
-      // Refresh the diff so the table reflects the new state.
       await runCompare();
     } catch (e) {
       setError(String(e));
@@ -230,22 +262,15 @@ export default function App() {
     }
   };
 
-  const selectedCount = useMemo(
-    () => changedEntries.filter((e) => selected.has(e.relPath)).length,
-    [changedEntries, selected]
-  );
-
   const pct =
-    progress && progress.total > 0
-      ? Math.round((progress.index / progress.total) * 100)
-      : 0;
+    progress && progress.total > 0 ? Math.round((progress.index / progress.total) * 100) : 0;
 
   return (
     <div className="app">
       <header className="topbar">
         <div className="brand">
           <span className="logo">⇄</span> SyncUI
-          <span className="subtitle">目录对比与同步（本地 → 远程/挂载）</span>
+          <span className="subtitle">目录对比与同步</span>
         </div>
       </header>
 
@@ -259,11 +284,11 @@ export default function App() {
           onBrowse={() => browse("local")}
           onClear={() => setLocalPath("")}
         />
-        <div className="arrow">→</div>
+        <div className="arrow">{mode === "twoway" ? "⇄" : "→"}</div>
         <DropZone
           ref={remoteRef}
           title="远程 / 挂载目录"
-          hint="sftp / smb 挂载点也可（拖入或浏览）"
+          hint="sftp / smb / nfs 挂载点也可"
           path={remotePath}
           active={dragOver === "remote"}
           onBrowse={() => browse("remote")}
@@ -273,23 +298,41 @@ export default function App() {
 
       <section className="controls">
         <label className="opt">
-          <input
-            type="checkbox"
-            checked={useHash}
-            onChange={(e) => setUseHash(e.target.checked)}
-          />
-          内容哈希校验（更准，更慢）
+          模式
+          <select value={mode} onChange={(e) => setMode(e.target.value as SyncMode)}>
+            <option value="mirror">镜像（本地→远程）</option>
+            <option value="twoway">双向（三方对比）</option>
+          </select>
         </label>
         <label className="opt">
+          冲突
+          <select
+            value={conflictPolicy}
+            disabled={mode !== "twoway"}
+            onChange={(e) => setConflictPolicy(e.target.value as ConflictPolicy)}
+          >
+            <option value="newer">较新优先</option>
+            <option value="local">用本地</option>
+            <option value="remote">用远程</option>
+            <option value="skip">跳过</option>
+          </select>
+        </label>
+        <label className="opt">
+          并发
           <input
-            type="checkbox"
-            checked={includeDeletes}
-            onChange={(e) => setIncludeDeletes(e.target.checked)}
+            type="number"
+            min={1}
+            max={32}
+            value={concurrency}
+            onChange={(e) => setConcurrency(Math.max(1, Math.min(32, +e.target.value || 1)))}
           />
-          同步删除（移除远程独有文件）
+        </label>
+        <label className="opt">
+          <input type="checkbox" checked={useHash} onChange={(e) => setUseHash(e.target.checked)} />
+          哈希校验
         </label>
         <label className="opt ignore">
-          忽略：
+          忽略
           <input
             type="text"
             value={ignoreText}
@@ -297,11 +340,7 @@ export default function App() {
             placeholder=".git, node_modules"
           />
         </label>
-        <button
-          className="btn primary"
-          onClick={runCompare}
-          disabled={comparing || syncing}
-        >
+        <button className="btn primary" onClick={runCompare} disabled={comparing || syncing}>
           {comparing ? "对比中…" : "对比 Compare"}
         </button>
       </section>
@@ -311,8 +350,8 @@ export default function App() {
       {comparing && (
         <div className="scanning">
           <span className="spinner" />
-          正在扫描{scanProgress?.phase === "remote" ? "远程" : "本地"}目录…
-          已发现 <b>{scanProgress?.count ?? 0}</b> 个文件
+          正在扫描{scanProgress?.phase === "remote" ? "远程" : "本地"}目录… 已发现{" "}
+          <b>{scanProgress?.count ?? 0}</b> 个文件
           <span className="scan-hint">（大目录请用"忽略"过滤以加速）</span>
         </div>
       )}
@@ -320,9 +359,17 @@ export default function App() {
       {result && (
         <section className="results">
           <div className="summary">
-            <Badge cls="st-new" n={result.newCount} label="新增" />
-            <Badge cls="st-mod" n={result.modifiedCount} label="修改" />
-            <Badge cls="st-del" n={result.deletedCount} label="远程独有" />
+            <Badge cls="st-up" n={result.uploadCount} label="上传" />
+            {mode === "twoway" && (
+              <Badge cls="st-down" n={result.downloadCount} label="下载" />
+            )}
+            <Badge cls="st-del" n={result.deleteRemoteCount} label="删远程" />
+            {mode === "twoway" && (
+              <Badge cls="st-del" n={result.deleteLocalCount} label="删本地" />
+            )}
+            {mode === "twoway" && (
+              <Badge cls="st-conf" n={result.conflictCount} label="冲突" />
+            )}
             <Badge cls="st-same" n={result.sameCount} label="一致" />
             {result.skippedCount > 0 && (
               <span className="badge" title="符号链接 / 无法访问 / 已失效的项，已安全跳过">
@@ -341,7 +388,7 @@ export default function App() {
               onClick={runSync}
               disabled={syncing || selectedCount === 0}
             >
-              {syncing ? "同步中…" : `同步选中 (${selectedCount}) →`}
+              {syncing ? "同步中…" : `同步选中 (${selectedCount})`}
             </button>
           </div>
 
@@ -355,15 +402,13 @@ export default function App() {
           <div className="table">
             <div className="row head">
               <span className="c-check" />
-              <span className="c-status">状态</span>
+              <span className="c-status">动作</span>
               <span className="c-path">相对路径</span>
               <span className="c-size">本地</span>
               <span className="c-size">远程</span>
               <span className="c-time">较新</span>
             </div>
-            {changedEntries.length === 0 && (
-              <div className="empty">没有差异，两端一致 🎉</div>
-            )}
+            {changedEntries.length === 0 && <div className="empty">没有差异，两端一致 🎉</div>}
             {changedEntries.map((e) => (
               <DiffRow
                 key={e.relPath}
@@ -396,8 +441,6 @@ function Badge({ cls, n, label }: { cls: string; n: number; label: string }) {
     </span>
   );
 }
-
-import { forwardRef } from "react";
 
 const DropZone = forwardRef<
   HTMLDivElement,
@@ -448,7 +491,7 @@ function DiffRow({
   checked: boolean;
   onToggle: () => void;
 }) {
-  const meta = STATUS_META[e.status];
+  const meta = ACTION_META[e.action];
   return (
     <label className="row">
       <span className="c-check">

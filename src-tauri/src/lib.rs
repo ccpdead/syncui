@@ -1,45 +1,17 @@
 //! Tauri command layer: bridges the frontend UI and the sync engine.
 
 mod engine;
+mod snapshot;
 
 use engine::{
-    compare_with_progress, copy_file_atomic, delete_file, CompareOptions, CompareResult,
+    apply_ops, build_snapshot, compare_with_progress, CompareOptions, CompareResult, OpProgress,
+    SyncOp, SyncResult,
 };
-use serde::{Deserialize, Serialize};
-use std::path::Path;
+use serde::Serialize;
+use std::path::{Path, PathBuf};
+use std::sync::Mutex;
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter};
-
-/// A single item the UI asked to synchronize.
-#[derive(Debug, Clone, Deserialize)]
-#[serde(rename_all = "camelCase")]
-struct SyncItem {
-    rel_path: String,
-    /// "new" | "modified" | "deleted"
-    status: String,
-}
-
-/// Progress event emitted to the frontend during a sync run.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SyncProgress {
-    index: usize,
-    total: usize,
-    rel_path: String,
-    action: String,
-    ok: bool,
-    error: Option<String>,
-}
-
-/// Final summary returned when a sync run completes.
-#[derive(Debug, Clone, Serialize)]
-#[serde(rename_all = "camelCase")]
-struct SyncResult {
-    copied: usize,
-    deleted: usize,
-    failed: usize,
-    errors: Vec<String>,
-}
+use tauri::{AppHandle, Emitter, Manager};
 
 /// Progress event emitted to the frontend while scanning directories.
 #[derive(Debug, Clone, Serialize)]
@@ -48,6 +20,20 @@ struct ScanProgress {
     /// "local" | "remote"
     phase: String,
     count: usize,
+}
+
+/// Compute the on-disk path of the baseline snapshot for a (local, remote)
+/// pair. Stored in the app config dir, keyed by a hash of both paths, so it
+/// never pollutes the user's synced directories.
+fn snapshot_path(app: &AppHandle, local: &str, remote: &str) -> Result<PathBuf, String> {
+    let dir = app
+        .path()
+        .app_config_dir()
+        .map_err(|e| format!("无法定位配置目录: {e}"))?;
+    let key = blake3::hash(format!("{local}\u{0}{remote}").as_bytes())
+        .to_hex()
+        .to_string();
+    Ok(dir.join("snapshots").join(format!("{key}.json")))
 }
 
 /// Compare two directories and return a structured diff for the UI.
@@ -62,12 +48,13 @@ async fn compare_dirs(
     options: Option<CompareOptions>,
 ) -> Result<CompareResult, String> {
     let opts = options.unwrap_or_default();
+    let snap_path = snapshot_path(&app, &local, &remote)?;
     tauri::async_runtime::spawn_blocking(move || {
+        let baseline = snapshot::load(&snap_path);
         let app2 = app.clone();
         let mut last = Instant::now();
         let mut started = false;
         let mut emit = move |phase: &str, count: usize| {
-            // Throttle events to ~8/sec to avoid flooding the event channel.
             if !started || last.elapsed() >= Duration::from_millis(120) {
                 started = true;
                 last = Instant::now();
@@ -80,85 +67,59 @@ async fn compare_dirs(
                 );
             }
         };
-        compare_with_progress(Path::new(&local), Path::new(&remote), &opts, &mut emit)
+        compare_with_progress(
+            Path::new(&local),
+            Path::new(&remote),
+            &opts,
+            &baseline,
+            &mut emit,
+        )
     })
     .await
     .map_err(|e| format!("对比任务失败: {e}"))?
 }
 
-/// Apply the selected sync items (local -> remote). Emits `sync-progress`
-/// events as it works and returns a summary at the end.
+/// Apply the selected operations (parallel), emit `sync-progress` events, then
+/// rebuild the baseline snapshot from the resulting state.
 #[tauri::command]
-fn sync_entries(
+async fn sync_entries(
     app: AppHandle,
     local: String,
     remote: String,
-    items: Vec<SyncItem>,
-    include_deletes: bool,
+    items: Vec<SyncOp>,
+    ignore: Vec<String>,
+    concurrency: Option<usize>,
 ) -> Result<SyncResult, String> {
-    let local_root = Path::new(&local);
-    let remote_root = Path::new(&remote);
-    let total = items.len();
-
-    let mut copied = 0usize;
-    let mut deleted = 0usize;
-    let mut failed = 0usize;
-    let mut errors: Vec<String> = Vec::new();
-
-    for (i, item) in items.iter().enumerate() {
-        let (action, result) = match item.status.as_str() {
-            "new" | "modified" => {
-                let src = local_root.join(&item.rel_path);
-                let dst = remote_root.join(&item.rel_path);
-                ("copy", copy_file_atomic(&src, &dst))
-            }
-            "deleted" => {
-                if include_deletes {
-                    let target = remote_root.join(&item.rel_path);
-                    ("delete", delete_file(&target))
-                } else {
-                    // Skip deletions unless the user explicitly opted in.
-                    continue;
-                }
-            }
-            other => ("skip", Err(format!("未知状态: {other}"))),
-        };
-
-        let (ok, err) = match &result {
-            Ok(_) => {
-                match action {
-                    "copy" => copied += 1,
-                    "delete" => deleted += 1,
-                    _ => {}
-                }
-                (true, None)
-            }
-            Err(e) => {
-                failed += 1;
-                errors.push(format!("{}: {}", item.rel_path, e));
-                (false, Some(e.clone()))
+    let snap_path = snapshot_path(&app, &local, &remote)?;
+    let workers = concurrency.unwrap_or(4);
+    tauri::async_runtime::spawn_blocking(move || {
+        let app2 = app.clone();
+        let last = Mutex::new(Instant::now());
+        let progress = move |p: OpProgress| {
+            let mut guard = last.lock().unwrap();
+            // Always emit the final event; throttle the rest to ~10/sec.
+            if p.index == p.total || guard.elapsed() >= Duration::from_millis(100) {
+                *guard = Instant::now();
+                let _ = app2.emit("sync-progress", p);
             }
         };
 
-        let _ = app.emit(
-            "sync-progress",
-            SyncProgress {
-                index: i + 1,
-                total,
-                rel_path: item.rel_path.clone(),
-                action: action.to_string(),
-                ok,
-                error: err,
-            },
+        let res = apply_ops(
+            Path::new(&local),
+            Path::new(&remote),
+            &items,
+            workers,
+            &progress,
         );
-    }
 
-    Ok(SyncResult {
-        copied,
-        deleted,
-        failed,
-        errors,
+        // Refresh the baseline so the next comparison is accurate.
+        let snap = build_snapshot(Path::new(&local), Path::new(&remote), &ignore);
+        let _ = snapshot::save(&snap_path, &snap);
+
+        Ok::<SyncResult, String>(res)
     })
+    .await
+    .map_err(|e| format!("同步任务失败: {e}"))?
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
