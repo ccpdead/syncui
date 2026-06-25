@@ -1,0 +1,18 @@
+# Use a China-friendly crates.io mirror to speed up dependency downloads.
+# This is scoped to the project and does not touch the global cargo config.
+[source.crates-io]
+replace-with = "rsproxy-sparse"
+
+[source.rsproxy-sparse]
+registry = "sparse+https://rsproxy.cn/index/"
+
+[registries.rsproxy]
+index = "sparse+https://rsproxy.cn/index/"
+
+[net]
+git-fetch-with-cli = true
+
+# The conda-forge rustc/LLVM in this env segfaults under parallel codegen on
+# this machine, so we pin to a single codegen job for stability.
+[build]
+jobs = 1
