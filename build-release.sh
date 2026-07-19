@@ -2,9 +2,23 @@
 # Build distributable bundles (.deb / .AppImage on Linux).
 set -e
 
-source "$(conda info --base)/etc/profile.d/conda.sh"
-conda activate sync_ui
+# Same WebKit workarounds as run-dev.sh (harmless during headless build).
+export WEBKIT_DISABLE_DMABUF_RENDERER=1
+export WEBKIT_DISABLE_COMPOSITING_MODE=1
 
-export RUST_MIN_STACK=16777216
+if ! command -v npm >/dev/null 2>&1; then
+  echo "error: npm not found. Install Node.js >= 20 first (see README)." >&2
+  exit 1
+fi
+
+if ! command -v cargo >/dev/null 2>&1; then
+  echo "error: cargo not found. Install Rust via rustup first (see README)." >&2
+  exit 1
+fi
+
+if [[ ! -d node_modules ]]; then
+  echo "node_modules missing — running npm install..."
+  npm install
+fi
 
 npm run tauri build

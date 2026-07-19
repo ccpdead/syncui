@@ -23,7 +23,7 @@
 - [快速开始](#快速开始)
   - [前置依赖](#前置依赖)
   - [获取代码](#获取代码)
-  - [创建环境](#创建环境)
+  - [安装依赖](#安装依赖)
   - [开发模式](#开发模式)
   - [打包发布](#打包发布)
 - [使用说明](#使用说明)
@@ -50,7 +50,6 @@
 - **哈希校验**：可选 BLAKE3 内容哈希，精确判断文件是否真正变更。
 - **并行执行**：有界 worker 池并发同步，并发数可调（默认 4）。
 - **忽略规则**：逗号分隔的名称列表，自动剪枝 `.git`、`node_modules` 等。
-- **conda 隔离**：Rust / Node / WebKit 全部通过 conda-forge 安装，不污染系统环境。
 
 ---
 
@@ -87,17 +86,55 @@ Tauri 命令层  src-tauri/src/lib.rs
 
 | 依赖 | 说明 |
 |------|------|
-| **Miniconda / Anaconda** | 用于创建隔离环境，管理 Rust、Node、WebKit 等依赖 |
-| **Linux（Ubuntu 20.04+）** | 当前已在 Ubuntu 验证；macOS / Windows 理论支持，待验证 |
+| **Linux（Ubuntu 20.04+ / 22.04+）** | 当前已在 Ubuntu 验证；macOS / Windows 理论支持，待验证 |
+| **Rust（rustup）** | ≥ 1.77，通过 [rustup](https://rustup.rs/) 安装 |
+| **Node.js** | ≥ 20，用于前端构建与 Tauri CLI |
+| **系统库（apt）** | WebKitGTK、GTK、OpenSSL 等 Tauri Linux 构建依赖 |
 
-> 不需要提前安装 Rust 或 Node——conda 会一并处理。
-
-安装 Miniconda（如已安装可跳过）：
+#### 1. 安装系统依赖（Debian / Ubuntu）
 
 ```bash
-wget https://repo.anaconda.com/miniconda/Miniconda3-latest-Linux-x86_64.sh
-bash Miniconda3-latest-Linux-x86_64.sh
-# 重新打开终端或执行 source ~/.bashrc 使 conda 生效
+sudo apt update
+sudo apt install -y \
+  libwebkit2gtk-4.1-dev \
+  build-essential \
+  curl \
+  wget \
+  file \
+  libxdo-dev \
+  libssl-dev \
+  libdbus-1-dev \
+  libayatana-appindicator3-dev \
+  librsvg2-dev \
+  pkg-config
+```
+
+> 其他发行版请参考 [Tauri Prerequisites](https://v2.tauri.app/start/prerequisites/)。
+
+#### 2. 安装 Rust
+
+```bash
+curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
+# 重新打开终端，或执行：
+source "$HOME/.cargo/env"
+rustc --version   # 确认 ≥ 1.77
+```
+
+#### 3. 安装 Node.js（≥ 20）
+
+任选其一：
+
+```bash
+# 方式 A：NodeSource（Debian / Ubuntu）
+curl -fsSL https://deb.nodesource.com/setup_20.x | sudo -E bash -
+sudo apt install -y nodejs
+
+# 方式 B：已有 nvm
+nvm install 20
+nvm use 20
+
+node -v   # 确认 ≥ v20
+npm -v
 ```
 
 ### 获取代码
@@ -107,18 +144,15 @@ git clone https://github.com/your-username/sync_ui.git
 cd sync_ui
 ```
 
-### 创建环境
+### 安装依赖
 
-首次克隆后执行一次，约需 5–15 分钟（下载 Rust 工具链 + Node + WebKit 依赖）：
+首次克隆后执行一次，安装前端 npm 包（Rust crates 会在首次编译时自动拉取）：
 
 ```bash
-conda env create -f environment.yml
+npm install
 ```
 
-环境名为 `sync_ui`，后续无需重复创建。
-
-> **网络提示**：`environment.yml` 使用 conda-forge 官方源。
-> `.cargo/config.toml` 已配置 rsproxy 镜像加速 crates 下载。
+> **网络提示**：`.npmrc` 已配置 npmmirror；`.cargo/config.toml` 已配置 rsproxy 镜像加速 crates 下载。
 > 如在境外，可删除 `.cargo/config.toml` 中的 `replace-with` 配置还原官方源。
 
 ### 开发模式
@@ -127,8 +161,14 @@ conda env create -f environment.yml
 ./run-dev.sh
 ```
 
-该脚本会自动激活 `sync_ui` 环境、设置必要的环境变量，并以热重载模式启动 Tauri 窗口。
+该脚本会设置必要的环境变量，并以热重载模式启动 Tauri 窗口。
 修改 `src/` 下的 React 代码后，前端即时刷新；修改 Rust 代码后会自动重新编译。
+
+也可直接：
+
+```bash
+npm run tauri dev
+```
 
 ### 打包发布
 
@@ -219,9 +259,8 @@ L（本地）vs B    R（远程）vs B     决策
 
 ```text
 sync_ui/
-├── environment.yml          ← conda 环境定义（rust/node/webkit 全部隔离）
 ├── .npmrc                   ← npm 配置（仅本项目生效）
-├── .cargo/config.toml       ← crates 镜像 + 单线程编译配置
+├── .cargo/config.toml       ← crates 镜像配置
 ├── run-dev.sh               ← 开发模式启动脚本
 ├── build-release.sh         ← 打包 .deb / .AppImage 脚本
 ├── package.json
@@ -252,7 +291,6 @@ sync_ui/
 ### 运行单元测试
 
 ```bash
-conda activate sync_ui
 cd src-tauri
 cargo test
 ```
@@ -274,7 +312,6 @@ cargo test
 
 | 变量 | 用途 |
 |------|------|
-| `RUST_MIN_STACK=16777216` | 防止 conda-forge LLVM 在大型项目中栈溢出 |
 | `WEBKIT_DISABLE_DMABUF_RENDERER=1` | 修复部分 Linux 驱动下 WebKit 白屏问题 |
 | `WEBKIT_DISABLE_COMPOSITING_MODE=1` | 同上，强制使用软件合成路径 |
 
@@ -282,22 +319,15 @@ cargo test
 
 ## 常见问题
 
-**Q: 运行 `./run-dev.sh` 提示 `conda: command not found`**
+**Q: 运行 `./run-dev.sh` 提示 `npm: command not found` / `cargo: command not found`**
 
-确保 conda 已初始化。执行 `conda init bash` 后重新打开终端。
+请确认已按[前置依赖](#前置依赖)安装 Node.js 与 Rust，并重新打开终端使 `PATH` 生效。
 
 ---
 
-**Q: Rust 编译时 SIGSEGV / 段错误**
+**Q: 编译时报缺少 `webkit2gtk-4.1` / `pkg-config` 相关错误**
 
-已知问题：conda-forge 的 LLVM 在部分机型上并行 codegen 会崩溃。
-项目已在 `.cargo/config.toml` 中固定 `jobs = 1`，同时 `run-dev.sh` 设置了
-`RUST_MIN_STACK=16777216`。如仍出现，尝试：
-
-```bash
-export CARGO_BUILD_JOBS=1
-./run-dev.sh
-```
+系统依赖未装全。在 Debian / Ubuntu 上重新执行[前置依赖](#前置依赖)中的 `apt install` 命令。
 
 ---
 
@@ -354,7 +384,7 @@ sudo mount -t nfs server:/export /mnt/remote
 3. 修改代码，确保 `cargo test` 通过
 4. 提交 PR，描述变更内容和测试方法
 
-Bug 报告请包含：操作系统版本、conda 版本、复现步骤和错误日志。
+Bug 报告请包含：操作系统版本、Node / Rust 版本、复现步骤和错误日志。
 
 ---
 
