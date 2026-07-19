@@ -230,6 +230,32 @@ export default function App() {
     else setSelected(new Set());
   };
 
+  /** Per-action selection stats, used by the clickable summary badges. */
+  const actionStats = useMemo(() => {
+    const stats = {} as Record<Action, { total: number; selected: number }>;
+    for (const e of changedEntries) {
+      const s = (stats[e.action] ??= { total: 0, selected: 0 });
+      s.total++;
+      if (selected.has(e.relPath)) s.selected++;
+    }
+    return stats;
+  }, [changedEntries, selected]);
+
+  /** Select or deselect every entry of one action type at once. */
+  const toggleAction = (action: Action) => {
+    const rels = changedEntries.filter((e) => e.action === action).map((e) => e.relPath);
+    if (rels.length === 0) return;
+    setSelected((prev) => {
+      const next = new Set(prev);
+      const allSelected = rels.every((r) => next.has(r));
+      for (const r of rels) {
+        if (allSelected) next.delete(r);
+        else next.add(r);
+      }
+      return next;
+    });
+  };
+
   const selectedCount = useMemo(
     () => changedEntries.filter((e) => selected.has(e.relPath)).length,
     [changedEntries, selected]
@@ -359,16 +385,41 @@ export default function App() {
       {result && (
         <section className="results">
           <div className="summary">
-            <Badge cls="st-up" n={result.uploadCount} label="上传" />
+            <ActionBadge
+              cls="st-up"
+              label="上传"
+              stat={actionStats.upload}
+              onToggle={() => toggleAction("upload")}
+            />
             {mode === "twoway" && (
-              <Badge cls="st-down" n={result.downloadCount} label="下载" />
+              <ActionBadge
+                cls="st-down"
+                label="下载"
+                stat={actionStats.download}
+                onToggle={() => toggleAction("download")}
+              />
             )}
-            <Badge cls="st-del" n={result.deleteRemoteCount} label="删远程" />
+            <ActionBadge
+              cls="st-del"
+              label="删远程"
+              stat={actionStats.deleteRemote}
+              onToggle={() => toggleAction("deleteRemote")}
+            />
             {mode === "twoway" && (
-              <Badge cls="st-del" n={result.deleteLocalCount} label="删本地" />
+              <ActionBadge
+                cls="st-del"
+                label="删本地"
+                stat={actionStats.deleteLocal}
+                onToggle={() => toggleAction("deleteLocal")}
+              />
             )}
             {mode === "twoway" && (
-              <Badge cls="st-conf" n={result.conflictCount} label="冲突" />
+              <ActionBadge
+                cls="st-conf"
+                label="冲突"
+                stat={actionStats.conflict}
+                onToggle={() => toggleAction("conflict")}
+              />
             )}
             <Badge cls="st-same" n={result.sameCount} label="一致" />
             {result.skippedCount > 0 && (
@@ -439,6 +490,38 @@ function Badge({ cls, n, label }: { cls: string; n: number; label: string }) {
     <span className={`badge ${cls}`}>
       {label} <b>{n}</b>
     </span>
+  );
+}
+
+/**
+ * Clickable summary badge: one click selects/deselects every diff entry of
+ * that action type. Shows "selected/total" when partially selected.
+ */
+function ActionBadge({
+  cls,
+  label,
+  stat,
+  onToggle,
+}: {
+  cls: string;
+  label: string;
+  stat: { total: number; selected: number } | undefined;
+  onToggle: () => void;
+}) {
+  const total = stat?.total ?? 0;
+  const sel = stat?.selected ?? 0;
+  const state = total === 0 ? "empty" : sel === 0 ? "none" : sel === total ? "all" : "part";
+  return (
+    <button
+      type="button"
+      className={`badge action ${cls} sel-${state}`}
+      disabled={total === 0}
+      onClick={onToggle}
+      title={total === 0 ? "无此类差异" : state === "all" ? `取消全部「${label}」` : `选中全部「${label}」`}
+    >
+      <span className="badge-check">{state === "all" ? "☑" : state === "part" ? "◪" : "☐"}</span>
+      {label} <b>{state === "part" ? `${sel}/${total}` : total}</b>
+    </button>
   );
 }
 

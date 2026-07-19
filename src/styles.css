@@ -232,6 +232,37 @@ body {
   color: var(--mod);
 }
 
+/* clickable per-action badges (batch select by type) */
+.badge.action {
+  cursor: pointer;
+  font-family: inherit;
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  transition: border-color 0.12s, background 0.12s;
+}
+.badge.action:hover:not(:disabled) {
+  border-color: var(--accent);
+}
+.badge.action:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+.badge.action.sel-all,
+.badge.action.sel-part {
+  border-color: var(--accent);
+  background: #16203a;
+}
+.badge-check {
+  font-size: 13px;
+  color: var(--muted);
+  line-height: 1;
+}
+.badge.action.sel-all .badge-check,
+.badge.action.sel-part .badge-check {
+  color: var(--accent);
+}
+
 .progress {
   position: relative;
   height: 18px;
