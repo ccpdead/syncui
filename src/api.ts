@@ -8,7 +8,7 @@ export type Action =
   | "conflict"
   | "same";
 
-export type SyncMode = "mirror" | "twoway";
+export type SyncMode = "mirror" | "mirror_pull" | "twoway";
 
 export type ConflictPolicy = "newer" | "local" | "remote" | "skip";
 
@@ -37,6 +37,17 @@ export interface CompareOptions {
   useHash: boolean;
   ignore: string[];
   mode: SyncMode;
+}
+
+/** Persisted UI preferences (stored under ~/.config/com.syncui.app/). */
+export interface AppSettings {
+  mode: SyncMode;
+  conflictPolicy: ConflictPolicy;
+  useHash: boolean;
+  concurrency: number;
+  ignoreText: string;
+  localPath: string;
+  remotePath: string;
 }
 
 /** A concrete operation sent to the backend. */
@@ -89,4 +100,12 @@ export function syncEntries(
     ignore,
     concurrency,
   });
+}
+
+export function loadSettings(): Promise<AppSettings> {
+  return invoke<AppSettings>("load_settings");
+}
+
+export function saveSettings(settings: AppSettings): Promise<void> {
+  return invoke("save_settings", { settings });
 }

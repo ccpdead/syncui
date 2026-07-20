@@ -33,8 +33,10 @@ pub struct CompareOptions {
     /// during the walk, so we never descend into them.
     #[serde(default)]
     pub ignore: Vec<String>,
-    /// "mirror" = one-way local -> remote. "twoway" = bidirectional using the
-    /// three-way (Local/Remote/Baseline) decision matrix.
+    /// Sync mode:
+    /// - `"mirror"` — one-way local → remote (make remote match local)
+    /// - `"mirror_pull"` — one-way remote → local (make local match remote)
+    /// - `"twoway"` — bidirectional using the three-way (L/R/Baseline) matrix
     #[serde(default = "default_mode")]
     pub mode: String,
 }
@@ -290,6 +292,7 @@ pub fn compare_with_progress(
     let (remote_map, remote_skipped) = scan(remote, &opts.ignore, &mut |n| progress("remote", n))?;
 
     let twoway = opts.mode == "twoway";
+    let mirror_pull = opts.mode == "mirror_pull";
 
     // Union of every relative path seen on either side (plus baseline in
     // two-way mode, so deletions are detected).
@@ -312,6 +315,8 @@ pub fn compare_with_progress(
 
         let action = if twoway {
             decide_twoway(&lp, l, &rp, r, b, opts.use_hash)
+        } else if mirror_pull {
+            decide_mirror_pull(&lp, l, &rp, r, opts.use_hash, b)
         } else {
             decide_mirror(&lp, l, &rp, r, opts.use_hash, b)
         };
@@ -388,6 +393,29 @@ fn decide_mirror(
         }
         (Some(_), None) => Some(Action::Upload),
         (None, Some(_)) => Some(Action::DeleteRemote), // remote extra
+        (None, None) => None,
+    }
+}
+
+/// One-way reverse mirror (make local match remote).
+fn decide_mirror_pull(
+    lp: &Path,
+    l: Option<&FileMeta>,
+    rp: &Path,
+    r: Option<&FileMeta>,
+    use_hash: bool,
+    base: Option<&SnapEntry>,
+) -> Option<Action> {
+    match (l, r) {
+        (Some(l), Some(r)) => {
+            if same_content(lp, l, rp, r, use_hash, base) {
+                Some(Action::Same)
+            } else {
+                Some(Action::Download)
+            }
+        }
+        (None, Some(_)) => Some(Action::Download),
+        (Some(_), None) => Some(Action::DeleteLocal), // local extra
         (None, None) => None,
     }
 }
@@ -742,6 +770,28 @@ mod tests {
         assert_eq!(res.same_count, 1);
         assert_eq!(find(&res, "new.txt").action, Action::Upload);
         assert_eq!(find(&res, "extra.txt").action, Action::DeleteRemote);
+
+        fs::remove_dir_all(&local).ok();
+        fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    fn mirror_pull_detects_download_and_delete_local() {
+        let local = tmp_dir("mp_local");
+        let remote = tmp_dir("mp_remote");
+        write(&local, "same.txt", "hello");
+        write(&remote, "same.txt", "hello");
+        write(&remote, "new.txt", "fresh"); // download
+        write(&local, "mod.txt", "short");
+        write(&remote, "mod.txt", "longer content"); // download (overwrite)
+        write(&local, "extra.txt", "old"); // local-only -> delete local
+
+        let res = compare(&local, &remote, &opts("mirror_pull")).unwrap();
+        assert_eq!(res.download_count, 2);
+        assert_eq!(res.delete_local_count, 1);
+        assert_eq!(res.same_count, 1);
+        assert_eq!(find(&res, "new.txt").action, Action::Download);
+        assert_eq!(find(&res, "extra.txt").action, Action::DeleteLocal);
 
         fs::remove_dir_all(&local).ok();
         fs::remove_dir_all(&remote).ok();

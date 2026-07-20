@@ -1,6 +1,7 @@
 //! Tauri command layer: bridges the frontend UI and the sync engine.
 
 mod engine;
+mod settings;
 mod snapshot;
 
 use engine::{
@@ -8,6 +9,7 @@ use engine::{
     SyncOp, SyncResult,
 };
 use serde::Serialize;
+use settings::AppSettings;
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
@@ -122,6 +124,16 @@ async fn sync_entries(
     .map_err(|e| format!("同步任务失败: {e}"))?
 }
 
+#[tauri::command]
+fn load_settings(app: AppHandle) -> AppSettings {
+    settings::load(&app)
+}
+
+#[tauri::command]
+fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), String> {
+    settings::save(&app, &settings)
+}
+
 /// On Linux, WebKitGTK's DMABUF / GPU compositing path fails with certain
 /// drivers and renders a blank (white) window. The dev script exports these
 /// vars, but a packaged binary (.deb / .AppImage) launched from a desktop
@@ -145,7 +157,12 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
-        .invoke_handler(tauri::generate_handler![compare_dirs, sync_entries])
+        .invoke_handler(tauri::generate_handler![
+            compare_dirs,
+            sync_entries,
+            load_settings,
+            save_settings
+        ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");
 }

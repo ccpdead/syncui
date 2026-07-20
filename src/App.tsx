@@ -5,6 +5,8 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   compareDirs,
   syncEntries,
+  loadSettings,
+  saveSettings,
   CompareResult,
   DiffEntry,
   SyncProgress,
@@ -15,6 +17,9 @@ import {
 } from "./api";
 
 type Side = "local" | "remote";
+
+const DEFAULT_IGNORE =
+  ".git, node_modules, .venv, __pycache__, target, dist, .DS_Store";
 
 const ACTION_META: Record<Action, { label: string; icon: string; cls: string }> = {
   upload: { label: "上传", icon: "↑", cls: "st-up" },
@@ -66,9 +71,8 @@ export default function App() {
   const [conflictPolicy, setConflictPolicy] = useState<ConflictPolicy>("newer");
   const [useHash, setUseHash] = useState(false);
   const [concurrency, setConcurrency] = useState(4);
-  const [ignoreText, setIgnoreText] = useState(
-    ".git, node_modules, .venv, __pycache__, target, dist, .DS_Store"
-  );
+  const [ignoreText, setIgnoreText] = useState(DEFAULT_IGNORE);
+  const [settingsReady, setSettingsReady] = useState(false);
 
   const [result, setResult] = useState<CompareResult | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
@@ -93,6 +97,82 @@ export default function App() {
     () => ignoreText.split(",").map((s) => s.trim()).filter(Boolean),
     [ignoreText]
   );
+
+  // Restore prefs from ~/.config/com.syncui.app/settings.json on startup.
+  useEffect(() => {
+    let cancelled = false;
+    loadSettings()
+      .then((s) => {
+        if (cancelled) return;
+        if (s.mode === "mirror" || s.mode === "mirror_pull" || s.mode === "twoway") {
+          setMode(s.mode);
+        }
+        if (
+          s.conflictPolicy === "newer" ||
+          s.conflictPolicy === "local" ||
+          s.conflictPolicy === "remote" ||
+          s.conflictPolicy === "skip"
+        ) {
+          setConflictPolicy(s.conflictPolicy);
+        }
+        setUseHash(!!s.useHash);
+        if (typeof s.concurrency === "number" && s.concurrency >= 1) {
+          setConcurrency(Math.max(1, Math.min(32, s.concurrency)));
+        }
+        if (typeof s.ignoreText === "string" && s.ignoreText.length > 0) {
+          setIgnoreText(s.ignoreText);
+        }
+        if (s.localPath) setLocalPath(s.localPath);
+        if (s.remotePath) setRemotePath(s.remotePath);
+      })
+      .catch(() => {
+        /* keep defaults */
+      })
+      .finally(() => {
+        if (!cancelled) setSettingsReady(true);
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, []);
+
+  // Debounced persist whenever prefs change (after initial load).
+  useEffect(() => {
+    if (!settingsReady) return;
+    const timer = window.setTimeout(() => {
+      saveSettings({
+        mode,
+        conflictPolicy,
+        useHash,
+        concurrency,
+        ignoreText,
+        localPath,
+        remotePath,
+      }).catch(() => {
+        /* ignore write errors in UI */
+      });
+    }, 300);
+    return () => window.clearTimeout(timer);
+  }, [
+    settingsReady,
+    mode,
+    conflictPolicy,
+    useHash,
+    concurrency,
+    ignoreText,
+    localPath,
+    remotePath,
+  ]);
+
+  const isTwoway = mode === "twoway";
+  const isMirrorPull = mode === "mirror_pull";
+  const showUpload = mode === "mirror" || isTwoway;
+  const showDownload = isMirrorPull || isTwoway;
+  const showDelRemote = mode === "mirror" || isTwoway;
+  const showDelLocal = isMirrorPull || isTwoway;
+  const modeLabel =
+    mode === "twoway" ? "双向" : mode === "mirror_pull" ? "镜像←" : "镜像→";
+  const arrowGlyph = isTwoway ? "⇄" : isMirrorPull ? "←" : "→";
 
   // Route a drop position to the nearest drop zone (Tauri reports logical px
   // on this stack; defensively scale down if a platform reports physical px).
@@ -199,7 +279,7 @@ export default function App() {
       );
       setSelected(preset);
       pushLog(
-        `对比完成(${mode === "twoway" ? "双向" : "镜像"})：↑${res.uploadCount} ↓${res.downloadCount} ` +
+        `对比完成(${modeLabel})：↑${res.uploadCount} ↓${res.downloadCount} ` +
           `删远程${res.deleteRemoteCount} 删本地${res.deleteLocalCount} 冲突${res.conflictCount} 一致${res.sameCount}` +
           (res.skippedCount ? ` 跳过${res.skippedCount}` : "")
       );
@@ -310,7 +390,7 @@ export default function App() {
           onBrowse={() => browse("local")}
           onClear={() => setLocalPath("")}
         />
-        <div className="arrow">{mode === "twoway" ? "⇄" : "→"}</div>
+        <div className="arrow">{arrowGlyph}</div>
         <DropZone
           ref={remoteRef}
           title="远程 / 挂载目录"
@@ -327,6 +407,7 @@ export default function App() {
           模式
           <select value={mode} onChange={(e) => setMode(e.target.value as SyncMode)}>
             <option value="mirror">镜像（本地→远程）</option>
+            <option value="mirror_pull">镜像（远程→本地）</option>
             <option value="twoway">双向（三方对比）</option>
           </select>
         </label>
@@ -334,7 +415,7 @@ export default function App() {
           冲突
           <select
             value={conflictPolicy}
-            disabled={mode !== "twoway"}
+            disabled={!isTwoway}
             onChange={(e) => setConflictPolicy(e.target.value as ConflictPolicy)}
           >
             <option value="newer">较新优先</option>
@@ -385,13 +466,15 @@ export default function App() {
       {result && (
         <section className="results">
           <div className="summary">
-            <ActionBadge
-              cls="st-up"
-              label="上传"
-              stat={actionStats.upload}
-              onToggle={() => toggleAction("upload")}
-            />
-            {mode === "twoway" && (
+            {showUpload && (
+              <ActionBadge
+                cls="st-up"
+                label="上传"
+                stat={actionStats.upload}
+                onToggle={() => toggleAction("upload")}
+              />
+            )}
+            {showDownload && (
               <ActionBadge
                 cls="st-down"
                 label="下载"
@@ -399,13 +482,15 @@ export default function App() {
                 onToggle={() => toggleAction("download")}
               />
             )}
-            <ActionBadge
-              cls="st-del"
-              label="删远程"
-              stat={actionStats.deleteRemote}
-              onToggle={() => toggleAction("deleteRemote")}
-            />
-            {mode === "twoway" && (
+            {showDelRemote && (
+              <ActionBadge
+                cls="st-del"
+                label="删远程"
+                stat={actionStats.deleteRemote}
+                onToggle={() => toggleAction("deleteRemote")}
+              />
+            )}
+            {showDelLocal && (
               <ActionBadge
                 cls="st-del"
                 label="删本地"
@@ -413,7 +498,7 @@ export default function App() {
                 onToggle={() => toggleAction("deleteLocal")}
               />
             )}
-            {mode === "twoway" && (
+            {isTwoway && (
               <ActionBadge
                 cls="st-conf"
                 label="冲突"
