@@ -24,6 +24,12 @@ filetime = "0.2"
 [profile.release]
 panic = "abort"
 codegen-units = 1
-lto = true
+lto = "thin"
 opt-level = "s"
 strip = true
+
+# Build scripts / proc-macros don't need aggressive opts; full LTO + codegen-units=1
+# on them easily OOMs when cargo parallelizes across many cores.
+[profile.release.build-override]
+opt-level = 0
+codegen-units = 256
