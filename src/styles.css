@@ -301,7 +301,235 @@ body {
   line-height: 18px;
 }
 
-/* ---- diff table ---- */
+/* ---- results split panes ---- */
+.results-body {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  align-items: stretch;
+  gap: 0;
+}
+.results-body.splitting {
+  cursor: col-resize;
+}
+.pane-left {
+  flex: none;
+  min-width: 200px;
+  max-width: calc(100% - 220px);
+  display: flex;
+  flex-direction: column;
+  min-height: 0;
+}
+.pane-left .selection-tree {
+  flex: 1;
+  height: 100%;
+}
+.pane-splitter {
+  flex: none;
+  width: 6px;
+  margin: 0 2px;
+  border-radius: 4px;
+  background: var(--border);
+  cursor: col-resize;
+  position: relative;
+  align-self: stretch;
+  transition: background 0.12s;
+}
+.pane-splitter::after {
+  content: "";
+  position: absolute;
+  top: 50%;
+  left: 50%;
+  width: 2px;
+  height: 28px;
+  transform: translate(-50%, -50%);
+  border-radius: 1px;
+  background: var(--muted);
+  opacity: 0.55;
+}
+.pane-splitter:hover,
+.results-body.splitting .pane-splitter {
+  background: var(--accent);
+}
+.pane-splitter:hover::after,
+.results-body.splitting .pane-splitter::after {
+  background: #fff;
+  opacity: 0.9;
+}
+.selection-tree {
+  min-width: 0;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.tree-toolbar {
+  flex: none;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  padding: 6px 10px;
+  background: var(--panel-2);
+  border-bottom: 1px solid var(--border);
+  font-size: 12px;
+  color: var(--muted);
+}
+.tree-title {
+  flex: 1;
+  font-weight: 600;
+  color: var(--text);
+}
+.tree-body {
+  flex: 1;
+  min-height: 0;
+  overflow: auto;
+  padding: 4px 0 8px;
+}
+.tree-empty {
+  padding: 20px 12px;
+  color: var(--muted);
+  font-size: 12.5px;
+  text-align: center;
+}
+.tree-row {
+  display: flex;
+  align-items: center;
+  gap: 4px;
+  min-height: 28px;
+  padding-right: 8px;
+}
+.tree-row:hover {
+  background: var(--panel-2);
+}
+.tree-row.file.active {
+  background: #16203a;
+}
+.tree-twist {
+  flex: none;
+  width: 18px;
+  height: 22px;
+  border: 0;
+  background: transparent;
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 11px;
+  line-height: 22px;
+  padding: 0;
+  font-family: inherit;
+}
+.tree-twist.spacer {
+  cursor: default;
+  visibility: hidden;
+}
+.tree-label {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  min-width: 0;
+  cursor: pointer;
+  flex: 1;
+}
+.tree-action {
+  flex: none;
+  font-size: 11px;
+  font-weight: 600;
+  white-space: nowrap;
+}
+.tree-dir,
+.tree-file {
+  font-family: ui-monospace, "Cascadia Code", monospace;
+  font-size: 12px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+}
+.tree-dir {
+  color: var(--text);
+  font-weight: 600;
+}
+.tree-file {
+  color: var(--muted);
+}
+.tree-count {
+  margin-left: 6px;
+  color: var(--muted);
+  font-weight: 400;
+  font-size: 11px;
+}
+.tree-meta {
+  flex: none;
+  font-size: 11px;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.tree-size {
+  width: 52px;
+  text-align: right;
+}
+.tree-newer {
+  width: 32px;
+  text-align: center;
+}
+.tree-diff {
+  flex: none;
+  margin-left: 4px;
+  padding: 1px 6px;
+  font-size: 11px;
+}
+.tree-diff-na {
+  flex: none;
+  width: 36px;
+}
+.diff-host {
+  flex: 1;
+  min-width: 180px;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  border: 1px solid var(--border);
+  border-radius: 10px;
+  background: var(--panel);
+  overflow: hidden;
+}
+.diff-panel {
+  flex: 1;
+  min-height: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  padding: 10px 12px;
+}
+.diff-placeholder {
+  flex: 1;
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  gap: 8px;
+  padding: 24px;
+  color: var(--muted);
+  text-align: center;
+}
+.diff-placeholder-title {
+  font-size: 15px;
+  font-weight: 600;
+  color: var(--text);
+}
+.diff-placeholder p {
+  margin: 0;
+  max-width: 360px;
+  font-size: 13px;
+  line-height: 1.5;
+}
+.badge.action.filter-on {
+  border-color: var(--accent);
+  background: #16203a;
+  box-shadow: 0 0 0 1px rgba(59, 130, 246, 0.35);
+}
+
 .table {
   flex: 1;
   min-height: 0;
@@ -312,7 +540,7 @@ body {
 }
 .row {
   display: grid;
-  grid-template-columns: 36px 110px 1fr 80px 80px 60px 64px;
+  grid-template-columns: 36px 110px 1fr 80px 80px 60px;
   align-items: center;
   gap: 8px;
   padding: 7px 12px;
@@ -688,5 +916,24 @@ body {
   }
   .drawer-split {
     grid-template-columns: 1fr;
+  }
+  .results-body {
+    flex-direction: column;
+  }
+  .pane-left {
+    width: 100% !important;
+    max-width: none;
+    min-height: 200px;
+    max-height: 40%;
+  }
+  .pane-splitter {
+    width: auto;
+    height: 6px;
+    margin: 2px 0;
+    cursor: row-resize;
+  }
+  .pane-splitter::after {
+    width: 28px;
+    height: 2px;
   }
 }

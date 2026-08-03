@@ -88,6 +88,8 @@ export interface DiffDrawerProps {
   onClose: () => void;
   /** Called after a successful save + recompare. `null` means path vanished. */
   onEntryUpdated: (entry: DiffEntry | null) => void;
+  /** Embed in the right results pane instead of an overlay drawer. */
+  embedded?: boolean;
 }
 
 export default function DiffDrawer({
@@ -97,8 +99,9 @@ export default function DiffDrawer({
   options,
   onClose,
   onEntryUpdated,
+  embedded = false,
 }: DiffDrawerProps) {
-  const [view, setView] = useState<ViewMode>("side");
+  const [view, setView] = useState<ViewMode>("unified");
   const [showLineNumbers, setShowLineNumbers] = useState(true);
   const [loading, setLoading] = useState(true);
   const [pair, setPair] = useState<FileTextPair | null>(null);
@@ -200,113 +203,125 @@ export default function DiffDrawer({
   if (localBlock) warnParts.push(`本地: ${localBlock}`);
   if (remoteBlock) warnParts.push(`远程: ${remoteBlock}`);
 
+  const body = (
+    <>
+      <header className="drawer-head">
+        <div className="drawer-title">
+          <span className="drawer-label">Diff</span>
+          <span className="drawer-path" title={entry.relPath}>
+            {entry.relPath}
+          </span>
+        </div>
+        <div className="drawer-actions">
+          <div className="seg">
+            <button
+              type="button"
+              className={view === "side" ? "on" : ""}
+              onClick={() => setView("side")}
+            >
+              对照
+            </button>
+            <button
+              type="button"
+              className={view === "unified" ? "on" : ""}
+              onClick={() => setView("unified")}
+            >
+              Unified
+            </button>
+          </div>
+          <label className="opt drawer-opt">
+            <input
+              type="checkbox"
+              checked={showLineNumbers}
+              onChange={(e) => setShowLineNumbers(e.target.checked)}
+            />
+            行号
+          </label>
+          <button
+            type="button"
+            className="btn"
+            disabled={!canEdit || !localDirty || saving !== null}
+            onClick={() => void saveSide("local")}
+          >
+            {saving === "local" ? "保存中…" : "保存本地"}
+          </button>
+          <button
+            type="button"
+            className="btn"
+            disabled={!canEdit || !remoteDirty || saving !== null}
+            onClick={() => void saveSide("remote")}
+          >
+            {saving === "remote" ? "保存中…" : "保存远程"}
+          </button>
+          <button type="button" className="btn" onClick={onClose}>
+            关闭
+          </button>
+        </div>
+      </header>
+
+      {status && <div className="drawer-status">{status}</div>}
+      {warnParts.length > 0 && (
+        <div className="drawer-warn">
+          {warnParts.map((w) => (
+            <div key={w}>⚠ {w}</div>
+          ))}
+        </div>
+      )}
+      {loadError && <div className="error">{loadError}</div>}
+      {loading && (
+        <div className="drawer-loading">
+          <span className="spinner" /> 正在读取文件…
+        </div>
+      )}
+
+      {!loading && canEdit && view === "side" && (
+        <div className="drawer-split">
+          <EditorPane
+            title="本地"
+            dirty={localDirty}
+            value={localText}
+            language={language}
+            showLineNumbers={showLineNumbers}
+            onChange={setLocalText}
+          />
+          <EditorPane
+            title="远程"
+            dirty={remoteDirty}
+            value={remoteText}
+            language={language}
+            showLineNumbers={showLineNumbers}
+            onChange={setRemoteText}
+          />
+        </div>
+      )}
+
+      {!loading && canEdit && view === "unified" && (
+        <UnifiedView
+          text={unifiedText}
+          showLineNumbers={showLineNumbers}
+          localText={localText}
+          remoteText={remoteText}
+        />
+      )}
+
+      {!loading && !canEdit && !loadError && warnParts.length === 0 && (
+        <div className="drawer-empty">无法展示差异</div>
+      )}
+    </>
+  );
+
+  if (embedded) {
+    return (
+      <div className="diff-panel" role="region" aria-label="文件差异">
+        {body}
+      </div>
+    );
+  }
+
   return (
     <div className="drawer-root" role="dialog" aria-modal="true">
       <div className="drawer-backdrop" onClick={onClose} />
-      <aside className="drawer-panel">
-        <header className="drawer-head">
-          <div className="drawer-title">
-            <span className="drawer-label">Diff</span>
-            <span className="drawer-path" title={entry.relPath}>
-              {entry.relPath}
-            </span>
-          </div>
-          <div className="drawer-actions">
-            <div className="seg">
-              <button
-                type="button"
-                className={view === "side" ? "on" : ""}
-                onClick={() => setView("side")}
-              >
-                对照
-              </button>
-              <button
-                type="button"
-                className={view === "unified" ? "on" : ""}
-                onClick={() => setView("unified")}
-              >
-                Unified
-              </button>
-            </div>
-            <label className="opt drawer-opt">
-              <input
-                type="checkbox"
-                checked={showLineNumbers}
-                onChange={(e) => setShowLineNumbers(e.target.checked)}
-              />
-              行号
-            </label>
-            <button
-              type="button"
-              className="btn"
-              disabled={!canEdit || !localDirty || saving !== null}
-              onClick={() => void saveSide("local")}
-            >
-              {saving === "local" ? "保存中…" : "保存本地"}
-            </button>
-            <button
-              type="button"
-              className="btn"
-              disabled={!canEdit || !remoteDirty || saving !== null}
-              onClick={() => void saveSide("remote")}
-            >
-              {saving === "remote" ? "保存中…" : "保存远程"}
-            </button>
-            <button type="button" className="btn" onClick={onClose}>
-              关闭
-            </button>
-          </div>
-        </header>
-
-        {status && <div className="drawer-status">{status}</div>}
-        {warnParts.length > 0 && (
-          <div className="drawer-warn">
-            {warnParts.map((w) => (
-              <div key={w}>⚠ {w}</div>
-            ))}
-          </div>
-        )}
-        {loadError && <div className="error">{loadError}</div>}
-        {loading && (
-          <div className="drawer-loading">
-            <span className="spinner" /> 正在读取文件…
-          </div>
-        )}
-
-        {!loading && canEdit && view === "side" && (
-          <div className="drawer-split">
-            <EditorPane
-              title="本地"
-              dirty={localDirty}
-              value={localText}
-              language={language}
-              showLineNumbers={showLineNumbers}
-              onChange={setLocalText}
-            />
-            <EditorPane
-              title="远程"
-              dirty={remoteDirty}
-              value={remoteText}
-              language={language}
-              showLineNumbers={showLineNumbers}
-              onChange={setRemoteText}
-            />
-          </div>
-        )}
-
-        {!loading && canEdit && view === "unified" && (
-          <UnifiedView
-            text={unifiedText}
-            showLineNumbers={showLineNumbers}
-            localText={localText}
-            remoteText={remoteText}
-          />
-        )}
-
-        {!loading && !canEdit && !loadError && warnParts.length === 0 && (
-          <div className="drawer-empty">无法展示差异</div>
-        )}
-      </aside>
+      <aside className="drawer-panel">{body}</aside>
     </div>
   );
 }

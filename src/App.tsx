@@ -16,6 +16,7 @@ import {
   ConflictPolicy,
 } from "./api";
 import DiffDrawer from "./DiffDrawer";
+import SelectionTree from "./SelectionTree";
 
 const DIFFABLE: ReadonlySet<Action> = new Set(["upload", "download", "conflict"]);
 
@@ -67,18 +68,6 @@ const ACTION_META: Record<Action, { label: string; icon: string; cls: string }> 
   same: { label: "一致", icon: "=", cls: "st-same" },
 };
 
-function fmtSize(n: number | null): string {
-  if (n == null) return "—";
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let v = n;
-  let i = 0;
-  while (v >= 1024 && i < units.length - 1) {
-    v /= 1024;
-    i++;
-  }
-  return `${v.toFixed(v >= 10 || i === 0 ? 0 : 1)}${units[i]}`;
-}
-
 /** Resolve a diff entry + conflict policy into a concrete backend op. */
 function entryToOp(e: DiffEntry, policy: ConflictPolicy): Op | null {
   switch (e.action) {
@@ -123,6 +112,12 @@ export default function App() {
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<Side | null>(null);
   const [diffEntry, setDiffEntry] = useState<DiffEntry | null>(null);
+  /** Action filter for tree + table view. "all" shows every changed entry. */
+  const [actionFilter, setActionFilter] = useState<Action | "all">("all");
+  /** Left pane width as % of results-body (draggable splitter). */
+  const [leftPanePct, setLeftPanePct] = useState(46);
+  const [splitting, setSplitting] = useState(false);
+  const resultsBodyRef = useRef<HTMLDivElement>(null);
 
   const localRef = useRef<HTMLDivElement>(null);
   const remoteRef = useRef<HTMLDivElement>(null);
@@ -283,6 +278,29 @@ export default function App() {
     };
   }, [pushLog]);
 
+  useEffect(() => {
+    if (!splitting) return;
+    const onMove = (e: MouseEvent) => {
+      const el = resultsBodyRef.current;
+      if (!el) return;
+      const rect = el.getBoundingClientRect();
+      if (rect.width <= 0) return;
+      const pct = ((e.clientX - rect.left) / rect.width) * 100;
+      setLeftPanePct(Math.min(72, Math.max(26, pct)));
+    };
+    const onUp = () => setSplitting(false);
+    window.addEventListener("mousemove", onMove);
+    window.addEventListener("mouseup", onUp);
+    document.body.style.cursor = "col-resize";
+    document.body.style.userSelect = "none";
+    return () => {
+      window.removeEventListener("mousemove", onMove);
+      window.removeEventListener("mouseup", onUp);
+      document.body.style.cursor = "";
+      document.body.style.userSelect = "";
+    };
+  }, [splitting]);
+
   const browse = async (side: Side) => {
     const picked = await open({ directory: true, multiple: false });
     if (typeof picked === "string") {
@@ -300,6 +318,7 @@ export default function App() {
     setComparing(true);
     setResult(null);
     setSelected(new Set());
+    setActionFilter("all");
     setScanProgress({ phase: "local", count: 0 });
     try {
       const res = await compareDirs(localPath, remotePath, {
@@ -308,14 +327,8 @@ export default function App() {
         mode,
       });
       setResult(res);
-      // Preselect only the safe additive ops (upload/download); deletes and
-      // conflicts require explicit opt-in.
-      const preset = new Set(
-        res.entries
-          .filter((e) => e.action === "upload" || e.action === "download")
-          .map((e) => e.relPath)
-      );
-      setSelected(preset);
+      // Right pane only lists tree selection — start empty so user picks via the tree.
+      setSelected(new Set());
       pushLog(
         `对比完成(${modeLabel})：↑${res.uploadCount} ↓${res.downloadCount} ` +
           `删远程${res.deleteRemoteCount} 删本地${res.deleteLocalCount} 冲突${res.conflictCount} 一致${res.sameCount}` +
@@ -338,14 +351,45 @@ export default function App() {
     });
   };
 
+  const toggleFiles = (rels: string[], select: boolean) => {
+    setSelected((prev) => {
+      const next = new Set(prev);
+      for (const r of rels) {
+        if (select) next.add(r);
+        else next.delete(r);
+      }
+      return next;
+    });
+  };
+
   const changedEntries = useMemo(
     () => (result ? result.entries.filter((e) => e.action !== "same") : []),
     [result]
   );
 
+  const visibleEntries = useMemo(
+    () =>
+      actionFilter === "all"
+        ? changedEntries
+        : changedEntries.filter((e) => e.action === actionFilter),
+    [changedEntries, actionFilter]
+  );
+
   const setAll = (on: boolean) => {
-    if (on) setSelected(new Set(changedEntries.map((e) => e.relPath)));
-    else setSelected(new Set());
+    const rels = visibleEntries.map((e) => e.relPath);
+    if (on) {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const r of rels) next.add(r);
+        return next;
+      });
+    } else {
+      setSelected((prev) => {
+        const next = new Set(prev);
+        for (const r of rels) next.delete(r);
+        return next;
+      });
+    }
   };
 
   /** Per-action selection stats, used by the clickable summary badges. */
@@ -359,19 +403,9 @@ export default function App() {
     return stats;
   }, [changedEntries, selected]);
 
-  /** Select or deselect every entry of one action type at once. */
-  const toggleAction = (action: Action) => {
-    const rels = changedEntries.filter((e) => e.action === action).map((e) => e.relPath);
-    if (rels.length === 0) return;
-    setSelected((prev) => {
-      const next = new Set(prev);
-      const allSelected = rels.every((r) => next.has(r));
-      for (const r of rels) {
-        if (allSelected) next.delete(r);
-        else next.add(r);
-      }
-      return next;
-    });
+  /** Toggle view filter for an action type (click again → show all). */
+  const setFilter = (action: Action) => {
+    setActionFilter((prev) => (prev === action ? "all" : action));
   };
 
   const selectedCount = useMemo(
@@ -539,7 +573,8 @@ export default function App() {
                 cls="st-up"
                 label="上传"
                 stat={actionStats.upload}
-                onToggle={() => toggleAction("upload")}
+                active={actionFilter === "upload"}
+                onToggle={() => setFilter("upload")}
               />
             )}
             {showDownload && (
@@ -547,7 +582,8 @@ export default function App() {
                 cls="st-down"
                 label="下载"
                 stat={actionStats.download}
-                onToggle={() => toggleAction("download")}
+                active={actionFilter === "download"}
+                onToggle={() => setFilter("download")}
               />
             )}
             {showDelRemote && (
@@ -555,7 +591,8 @@ export default function App() {
                 cls="st-del"
                 label="删远程"
                 stat={actionStats.deleteRemote}
-                onToggle={() => toggleAction("deleteRemote")}
+                active={actionFilter === "deleteRemote"}
+                onToggle={() => setFilter("deleteRemote")}
               />
             )}
             {showDelLocal && (
@@ -563,7 +600,8 @@ export default function App() {
                 cls="st-del"
                 label="删本地"
                 stat={actionStats.deleteLocal}
-                onToggle={() => toggleAction("deleteLocal")}
+                active={actionFilter === "deleteLocal"}
+                onToggle={() => setFilter("deleteLocal")}
               />
             )}
             {isTwoway && (
@@ -571,7 +609,8 @@ export default function App() {
                 cls="st-conf"
                 label="冲突"
                 stat={actionStats.conflict}
-                onToggle={() => toggleAction("conflict")}
+                active={actionFilter === "conflict"}
+                onToggle={() => setFilter("conflict")}
               />
             )}
             <Badge cls="st-same" n={result.sameCount} label="一致" />
@@ -580,11 +619,24 @@ export default function App() {
                 跳过 <b>{result.skippedCount}</b>
               </span>
             )}
+            {actionFilter !== "all" && (
+              <button className="link" onClick={() => setActionFilter("all")} title="显示全部差异">
+                清除筛选
+              </button>
+            )}
             <div className="spacer" />
-            <button className="link" onClick={() => setAll(true)}>
-              全选
+            <button
+              className="link"
+              onClick={() => setAll(true)}
+              title={actionFilter === "all" ? "选中全部差异" : "选中当前筛选全部"}
+            >
+              全选{actionFilter !== "all" ? ` (${visibleEntries.length})` : ""}
             </button>
-            <button className="link" onClick={() => setAll(false)}>
+            <button
+              className="link"
+              onClick={() => setAll(false)}
+              title={actionFilter === "all" ? "清空全部选中" : "取消当前筛选的选中"}
+            >
               清空
             </button>
             <button
@@ -603,26 +655,59 @@ export default function App() {
             </div>
           )}
 
-          <div className="table">
-            <div className="row head">
-              <span className="c-check" />
-              <span className="c-status">动作</span>
-              <span className="c-path">相对路径</span>
-              <span className="c-size">本地</span>
-              <span className="c-size">远程</span>
-              <span className="c-time">较新</span>
-              <span className="c-diff">Diff</span>
-            </div>
-            {changedEntries.length === 0 && <div className="empty">没有差异，两端一致 🎉</div>}
-            {changedEntries.map((e) => (
-              <DiffRow
-                key={e.relPath}
-                e={e}
-                checked={selected.has(e.relPath)}
-                onToggle={() => toggle(e.relPath)}
-                onDiff={DIFFABLE.has(e.action) ? () => setDiffEntry(e) : undefined}
+          <div
+            ref={resultsBodyRef}
+            className={`results-body${splitting ? " splitting" : ""}`}
+          >
+            <div className="pane-left" style={{ width: `${leftPanePct}%` }}>
+              <SelectionTree
+                entries={visibleEntries}
+                selected={selected}
+                activePath={diffEntry?.relPath ?? null}
+                actionMeta={ACTION_META}
+                diffable={new Set(
+                  visibleEntries.filter((e) => DIFFABLE.has(e.action)).map((e) => e.relPath)
+                )}
+                onToggleFile={toggle}
+                onToggleFiles={toggleFiles}
+                onDiff={(rel) => {
+                  const e =
+                    visibleEntries.find((x) => x.relPath === rel) ??
+                    changedEntries.find((x) => x.relPath === rel);
+                  if (e) setDiffEntry(e);
+                }}
               />
-            ))}
+            </div>
+            <div
+              className="pane-splitter"
+              role="separator"
+              aria-orientation="vertical"
+              aria-label="拖动调整左右宽度"
+              title="拖动调整左右宽度"
+              onMouseDown={(e) => {
+                e.preventDefault();
+                setSplitting(true);
+              }}
+            />
+            <div className="diff-host">
+              {diffEntry ? (
+                <DiffDrawer
+                  key={diffEntry.relPath}
+                  embedded
+                  entry={diffEntry}
+                  localRoot={localPath}
+                  remoteRoot={remotePath}
+                  options={{ useHash, ignore: ignoreList, mode }}
+                  onClose={() => setDiffEntry(null)}
+                  onEntryUpdated={(updated) => applyEntryUpdate(diffEntry.relPath, updated)}
+                />
+              ) : (
+                <div className="diff-placeholder">
+                  <div className="diff-placeholder-title">文件差异</div>
+                  <p>在左侧点击文件行的 Diff，在此查看内容差异后再决定是否勾选同步。</p>
+                </div>
+              )}
+            </div>
           </div>
         </section>
       )}
@@ -635,17 +720,6 @@ export default function App() {
             </div>
           ))}
         </section>
-      )}
-
-      {diffEntry && (
-        <DiffDrawer
-          entry={diffEntry}
-          localRoot={localPath}
-          remoteRoot={remotePath}
-          options={{ useHash, ignore: ignoreList, mode }}
-          onClose={() => setDiffEntry(null)}
-          onEntryUpdated={(updated) => applyEntryUpdate(diffEntry.relPath, updated)}
-        />
       )}
     </div>
   );
@@ -660,18 +734,20 @@ function Badge({ cls, n, label }: { cls: string; n: number; label: string }) {
 }
 
 /**
- * Clickable summary badge: one click selects/deselects every diff entry of
- * that action type. Shows "selected/total" when partially selected.
+ * Summary badge: click filters the tree + table to this action type
+ * (click again to clear). Shows selection stats for that type.
  */
 function ActionBadge({
   cls,
   label,
   stat,
+  active,
   onToggle,
 }: {
   cls: string;
   label: string;
   stat: { total: number; selected: number } | undefined;
+  active: boolean;
   onToggle: () => void;
 }) {
   const total = stat?.total ?? 0;
@@ -680,10 +756,16 @@ function ActionBadge({
   return (
     <button
       type="button"
-      className={`badge action ${cls} sel-${state}`}
+      className={`badge action ${cls} sel-${state}${active ? " filter-on" : ""}`}
       disabled={total === 0}
       onClick={onToggle}
-      title={total === 0 ? "无此类差异" : state === "all" ? `取消全部「${label}」` : `选中全部「${label}」`}
+      title={
+        total === 0
+          ? "无此类差异"
+          : active
+          ? `取消筛选「${label}」`
+          : `筛选「${label}」（树与列表仅显示此类）`
+      }
     >
       <span className="badge-check">{state === "all" ? "☑" : state === "part" ? "◪" : "☐"}</span>
       {label} <b>{state === "part" ? `${sel}/${total}` : total}</b>
@@ -730,44 +812,3 @@ const DropZone = forwardRef<
     </div>
   );
 });
-
-function DiffRow({
-  e,
-  checked,
-  onToggle,
-  onDiff,
-}: {
-  e: DiffEntry;
-  checked: boolean;
-  onToggle: () => void;
-  onDiff?: () => void;
-}) {
-  const meta = ACTION_META[e.action];
-  return (
-    <div className="row">
-      <label className="c-check">
-        <input type="checkbox" checked={checked} onChange={onToggle} />
-      </label>
-      <span className={`c-status ${meta.cls}`}>
-        {meta.icon} {meta.label}
-      </span>
-      <span className="c-path" title={e.relPath}>
-        {e.relPath}
-      </span>
-      <span className="c-size">{fmtSize(e.localSize)}</span>
-      <span className="c-size">{fmtSize(e.remoteSize)}</span>
-      <span className="c-time">
-        {e.newer === "local" ? "本地" : e.newer === "remote" ? "远程" : "—"}
-      </span>
-      <span className="c-diff">
-        {onDiff ? (
-          <button type="button" className="btn diff-btn" onClick={onDiff}>
-            Diff
-          </button>
-        ) : (
-          <span className="diff-na">—</span>
-        )}
-      </span>
-    </div>
-  );
-}
