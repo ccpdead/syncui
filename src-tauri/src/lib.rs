@@ -5,8 +5,8 @@ mod settings;
 mod snapshot;
 
 use engine::{
-    apply_ops, build_snapshot, compare_with_progress, CompareOptions, CompareResult, OpProgress,
-    SyncOp, SyncResult,
+    apply_ops, build_snapshot, compare_one, compare_with_progress, read_text_pair, write_text_file,
+    CompareOptions, CompareResult, DiffEntry, FileTextPair, OpProgress, SyncOp, SyncResult,
 };
 use serde::Serialize;
 use settings::AppSettings;
@@ -134,6 +134,66 @@ fn save_settings(app: AppHandle, settings: AppSettings) -> Result<(), String> {
     settings::save(&app, &settings)
 }
 
+/// Read local + remote text for content diff (binary / >5MB gated).
+#[tauri::command]
+async fn read_file_pair(
+    local: String,
+    remote: String,
+    rel_path: String,
+) -> Result<FileTextPair, String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        read_text_pair(Path::new(&local), Path::new(&remote), &rel_path)
+    })
+    .await
+    .map_err(|e| format!("读取任务失败: {e}"))?
+}
+
+/// Write UTF-8 content to one side: side = "local" | "remote".
+#[tauri::command]
+async fn write_file_text(
+    local: String,
+    remote: String,
+    rel_path: String,
+    side: String,
+    content: String,
+) -> Result<(), String> {
+    tauri::async_runtime::spawn_blocking(move || {
+        let root = match side.as_str() {
+            "local" => Path::new(&local),
+            "remote" => Path::new(&remote),
+            _ => return Err(format!("未知写入侧: {side}")),
+        };
+        write_text_file(root, &rel_path, &content)
+    })
+    .await
+    .map_err(|e| format!("写入任务失败: {e}"))?
+}
+
+/// Re-compare a single relative path after an in-diff save.
+#[tauri::command]
+async fn compare_one_entry(
+    app: AppHandle,
+    local: String,
+    remote: String,
+    rel_path: String,
+    options: Option<CompareOptions>,
+) -> Result<Option<DiffEntry>, String> {
+    let opts = options.unwrap_or_default();
+    let snap_path = snapshot_path(&app, &local, &remote)?;
+    tauri::async_runtime::spawn_blocking(move || {
+        let baseline = snapshot::load(&snap_path);
+        compare_one(
+            Path::new(&local),
+            Path::new(&remote),
+            &rel_path,
+            &opts,
+            &baseline,
+        )
+    })
+    .await
+    .map_err(|e| format!("单文件对比失败: {e}"))?
+}
+
 /// On Linux, WebKitGTK's DMABUF / GPU compositing path fails with certain
 /// drivers and renders a blank (white) window. The dev script exports these
 /// vars, but a packaged binary (.deb / .AppImage) launched from a desktop
@@ -161,7 +221,10 @@ pub fn run() {
             compare_dirs,
             sync_entries,
             load_settings,
-            save_settings
+            save_settings,
+            read_file_pair,
+            write_file_text,
+            compare_one_entry
         ])
         .run(tauri::generate_context!())
         .expect("error while running tauri application");

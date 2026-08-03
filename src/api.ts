@@ -78,6 +78,23 @@ export interface SyncResult {
   errors: string[];
 }
 
+export interface FileTextSide {
+  exists: boolean;
+  size: number;
+  content: string | null;
+  binary: boolean;
+  tooLarge: boolean;
+  error: string | null;
+}
+
+export interface FileTextPair {
+  relPath: string;
+  local: FileTextSide;
+  remote: FileTextSide;
+}
+
+export type WriteSide = "local" | "remote";
+
 export function compareDirs(
   local: string,
   remote: string,
@@ -108,4 +125,36 @@ export function loadSettings(): Promise<AppSettings> {
 
 export function saveSettings(settings: AppSettings): Promise<void> {
   return invoke("save_settings", { settings });
+}
+
+export function readFilePair(
+  local: string,
+  remote: string,
+  relPath: string
+): Promise<FileTextPair> {
+  return invoke<FileTextPair>("read_file_pair", { local, remote, relPath });
+}
+
+export function writeFileText(
+  local: string,
+  remote: string,
+  relPath: string,
+  side: WriteSide,
+  content: string
+): Promise<void> {
+  return invoke("write_file_text", { local, remote, relPath, side, content });
+}
+
+export function compareOneEntry(
+  local: string,
+  remote: string,
+  relPath: string,
+  options: CompareOptions
+): Promise<DiffEntry | null> {
+  return invoke<DiffEntry | null>("compare_one_entry", {
+    local,
+    remote,
+    relPath,
+    options,
+  });
 }

@@ -2,6 +2,7 @@
   "productName": "SyncUI",
   "version": "0.1.0",
   "identifier": "com.syncui.app",
+  "mainBinaryName": "syncui",
   "build": {
     "beforeDevCommand": "npm run dev",
     "devUrl": "http://127.0.0.1:1420",

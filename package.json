@@ -1,5 +1,5 @@
 {
-  "name": "sync-ui",
+  "name": "syncui",
   "private": true,
   "version": "0.1.0",
   "type": "module",
@@ -12,11 +12,16 @@
   "dependencies": {
     "@tauri-apps/api": "^2.0.0",
     "@tauri-apps/plugin-dialog": "^2.0.0",
+    "@uiw/react-textarea-code-editor": "^3.1.1",
+    "diff": "^9.0.0",
+    "highlight.js": "^11.11.1",
     "react": "^18.3.1",
     "react-dom": "^18.3.1"
   },
   "devDependencies": {
     "@tauri-apps/cli": "^2.0.0",
+    "@types/diff": "^7.0.2",
+    "@types/highlight.js": "^9.12.4",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",

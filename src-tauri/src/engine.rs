@@ -9,7 +9,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Mutex;
 use std::time::UNIX_EPOCH;
@@ -711,6 +711,241 @@ pub fn build_snapshot(local: &Path, remote: &Path, ignore: &[String]) -> Snapsho
     snap
 }
 
+// ----------------------------- content diff I/O -----------------------------
+
+/// Max file size (bytes) allowed for content diff / edit in the UI.
+pub const MAX_DIFF_BYTES: u64 = 5 * 1024 * 1024;
+
+/// One side of a text-pair load result.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTextSide {
+    pub exists: bool,
+    pub size: u64,
+    /// UTF-8 text when readable; absent when missing / binary / too large / error.
+    pub content: Option<String>,
+    pub binary: bool,
+    pub too_large: bool,
+    pub error: Option<String>,
+}
+
+/// Local + remote text payload for a single relative path.
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileTextPair {
+    pub rel_path: String,
+    pub local: FileTextSide,
+    pub remote: FileTextSide,
+}
+
+/// Resolve `rel` under `root`, rejecting `..` and absolute paths.
+fn resolve_under(root: &Path, rel: &str) -> Result<PathBuf, String> {
+    if rel.is_empty() || rel.contains('\0') {
+        return Err("无效相对路径".into());
+    }
+    let rel_path = Path::new(rel);
+    if rel_path.is_absolute()
+        || rel_path
+            .components()
+            .any(|c| matches!(c, Component::ParentDir | Component::RootDir | Component::Prefix(_)))
+    {
+        return Err("相对路径不允许包含 .. 或绝对路径".into());
+    }
+    Ok(root.join(rel_path))
+}
+
+fn meta_of_file(path: &Path) -> Option<FileMeta> {
+    let meta = fs::metadata(path).ok()?;
+    if !meta.is_file() {
+        return None;
+    }
+    Some(FileMeta {
+        size: meta.len(),
+        mtime: mtime_of(&meta),
+    })
+}
+
+/// Heuristic: NUL in the first chunk => binary; otherwise require valid UTF-8.
+fn looks_binary(bytes: &[u8]) -> bool {
+    let probe = &bytes[..bytes.len().min(8192)];
+    if probe.contains(&0) {
+        return true;
+    }
+    false
+}
+
+fn read_text_side(path: &Path) -> FileTextSide {
+    match fs::metadata(path) {
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => FileTextSide {
+            exists: false,
+            size: 0,
+            content: None,
+            binary: false,
+            too_large: false,
+            error: None,
+        },
+        Err(e) => FileTextSide {
+            exists: false,
+            size: 0,
+            content: None,
+            binary: false,
+            too_large: false,
+            error: Some(format!("无法访问: {e}")),
+        },
+        Ok(meta) => {
+            if !meta.is_file() {
+                return FileTextSide {
+                    exists: true,
+                    size: meta.len(),
+                    content: None,
+                    binary: false,
+                    too_large: false,
+                    error: Some("不是普通文件".into()),
+                };
+            }
+            let size = meta.len();
+            if size > MAX_DIFF_BYTES {
+                return FileTextSide {
+                    exists: true,
+                    size,
+                    content: None,
+                    binary: false,
+                    too_large: true,
+                    error: None,
+                };
+            }
+            match fs::read(path) {
+                Err(e) => FileTextSide {
+                    exists: true,
+                    size,
+                    content: None,
+                    binary: false,
+                    too_large: false,
+                    error: Some(format!("读取失败: {e}")),
+                },
+                Ok(bytes) => {
+                    if looks_binary(&bytes) {
+                        return FileTextSide {
+                            exists: true,
+                            size,
+                            content: None,
+                            binary: true,
+                            too_large: false,
+                            error: None,
+                        };
+                    }
+                    match String::from_utf8(bytes) {
+                        Ok(content) => FileTextSide {
+                            exists: true,
+                            size,
+                            content: Some(content),
+                            binary: false,
+                            too_large: false,
+                            error: None,
+                        },
+                        Err(_) => FileTextSide {
+                            exists: true,
+                            size,
+                            content: None,
+                            binary: true,
+                            too_large: false,
+                            error: None,
+                        },
+                    }
+                }
+            }
+        }
+    }
+}
+
+/// Load local + remote text for content diff (size / binary gated).
+pub fn read_text_pair(local: &Path, remote: &Path, rel: &str) -> Result<FileTextPair, String> {
+    let lp = resolve_under(local, rel)?;
+    let rp = resolve_under(remote, rel)?;
+    Ok(FileTextPair {
+        rel_path: rel.replace('\\', "/"),
+        local: read_text_side(&lp),
+        remote: read_text_side(&rp),
+    })
+}
+
+/// Write UTF-8 text to one side (`"local"` | `"remote"`), creating parents.
+pub fn write_text_file(root: &Path, rel: &str, content: &str) -> Result<(), String> {
+    let path = resolve_under(root, rel)?;
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+    }
+    // Atomic-ish write via temp + rename, with direct-write fallback for gvfs.
+    let tmp: PathBuf = {
+        let mut p = path.to_path_buf();
+        let name = format!(
+            ".{}.synctmp",
+            path.file_name()
+                .map(|n| n.to_string_lossy().to_string())
+                .unwrap_or_default()
+        );
+        p.set_file_name(name);
+        p
+    };
+    fs::write(&tmp, content.as_bytes()).map_err(|e| format!("写入失败: {e}"))?;
+    match fs::rename(&tmp, &path) {
+        Ok(()) => Ok(()),
+        Err(_) => {
+            let direct = fs::write(&path, content.as_bytes()).map_err(|e| format!("写入失败: {e}"));
+            let _ = fs::remove_file(&tmp);
+            direct
+        }
+    }
+}
+
+/// Re-compare a single relative path and return its DiffEntry (or None if gone).
+pub fn compare_one(
+    local: &Path,
+    remote: &Path,
+    rel: &str,
+    opts: &CompareOptions,
+    baseline: &Snapshot,
+) -> Result<Option<DiffEntry>, String> {
+    let rel = rel.replace('\\', "/");
+    if is_ignored(&rel, &opts.ignore) {
+        return Ok(None);
+    }
+    let lp = resolve_under(local, &rel)?;
+    let rp = resolve_under(remote, &rel)?;
+    let l = meta_of_file(&lp);
+    let r = meta_of_file(&rp);
+    let b = baseline.files.get(&rel);
+
+    if l.is_none() && r.is_none() && !(opts.mode == "twoway" && b.is_some()) {
+        return Ok(None);
+    }
+
+    let twoway = opts.mode == "twoway";
+    let mirror_pull = opts.mode == "mirror_pull";
+    let action = if twoway {
+        decide_twoway(&lp, l.as_ref(), &rp, r.as_ref(), b, opts.use_hash)
+    } else if mirror_pull {
+        decide_mirror_pull(&lp, l.as_ref(), &rp, r.as_ref(), opts.use_hash, b)
+    } else {
+        decide_mirror(&lp, l.as_ref(), &rp, r.as_ref(), opts.use_hash, b)
+    };
+
+    let action = match action {
+        Some(a) => a,
+        None => return Ok(None),
+    };
+
+    Ok(Some(DiffEntry {
+        rel_path: rel,
+        action,
+        local_size: l.as_ref().map(|m| m.size),
+        remote_size: r.as_ref().map(|m| m.size),
+        local_mtime: l.as_ref().map(|m| m.mtime),
+        remote_mtime: r.as_ref().map(|m| m.mtime),
+        newer: newer_of(l.as_ref(), r.as_ref()),
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -906,6 +1141,47 @@ mod tests {
         let res = compare(&local, &remote, &opts("mirror")).unwrap();
         assert_eq!(res.upload_count, 1, "only the real file uploads");
         assert!(res.skipped_count >= 1, "broken symlink counted as skipped");
+
+        fs::remove_dir_all(&local).ok();
+        fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    fn read_write_text_pair_and_compare_one() {
+        let local = tmp_dir("d_local");
+        let remote = tmp_dir("d_remote");
+        write(&local, "cfg/a.yaml", "a: 1\n");
+        write(&remote, "cfg/a.yaml", "a: 2\n");
+
+        let pair = read_text_pair(&local, &remote, "cfg/a.yaml").unwrap();
+        assert_eq!(pair.local.content.as_deref(), Some("a: 1\n"));
+        assert_eq!(pair.remote.content.as_deref(), Some("a: 2\n"));
+        assert!(!pair.local.binary && !pair.remote.too_large);
+
+        write_text_file(&remote, "cfg/a.yaml", "a: 1\n").unwrap();
+        let entry = compare_one(
+            &local,
+            &remote,
+            "cfg/a.yaml",
+            &opts("mirror"),
+            &Snapshot::default(),
+        )
+        .unwrap()
+        .unwrap();
+        assert_eq!(entry.action, Action::Same);
+
+        // Binary / oversized rejection
+        let mut big = vec![0u8; (MAX_DIFF_BYTES as usize) + 1];
+        big[0] = b'x';
+        fs::write(local.join("big.bin"), &big).unwrap();
+        fs::write(remote.join("big.bin"), &big).unwrap();
+        let big_pair = read_text_pair(&local, &remote, "big.bin").unwrap();
+        assert!(big_pair.local.too_large);
+
+        fs::write(local.join("nul.bin"), b"ok\0no").unwrap();
+        fs::write(remote.join("nul.bin"), b"ok\0no").unwrap();
+        let bin_pair = read_text_pair(&local, &remote, "nul.bin").unwrap();
+        assert!(bin_pair.local.binary);
 
         fs::remove_dir_all(&local).ok();
         fs::remove_dir_all(&remote).ok();

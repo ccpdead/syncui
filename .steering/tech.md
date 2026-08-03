@@ -51,8 +51,8 @@ npm run build
 
 ```text
 src-tauri/target/release/bundle/
-├── deb/       ← sync-ui_0.1.0_amd64.deb
-└── appimage/  ← sync-ui_0.1.0_amd64.AppImage
+├── deb/       ← SyncUI_0.1.0_amd64.deb（Package: syncui）
+└── appimage/  ← SyncUI_0.1.0_amd64.AppImage
 ```
 
 ## 运行
@@ -63,10 +63,11 @@ src-tauri/target/release/bundle/
 # 等价于：npm run tauri dev
 
 # 安装 / 运行发布包
-sudo dpkg -i src-tauri/target/release/bundle/deb/sync-ui_*.deb
+sudo dpkg -r sync-ui 2>/dev/null || true
+sudo dpkg -i src-tauri/target/release/bundle/deb/SyncUI_*.deb
 # 或免安装运行 AppImage
-chmod +x src-tauri/target/release/bundle/appimage/sync-ui_*.AppImage
-./src-tauri/target/release/bundle/appimage/sync-ui_*.AppImage
+chmod +x src-tauri/target/release/bundle/appimage/SyncUI_*.AppImage
+./src-tauri/target/release/bundle/appimage/SyncUI_*.AppImage
 ```
 
 ## 测试

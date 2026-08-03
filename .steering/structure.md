@@ -18,7 +18,7 @@ sync_ui/
 │   ├── api.ts               ← 与 Rust 命令的类型化桥接层（invoke 封装 + 全部类型定义）
 │   └── styles.css
 └── src-tauri/               ← 后端（Rust）
-    ├── Cargo.toml           ← crate 名 sync-ui，lib 名 sync_ui_lib
+    ├── Cargo.toml           ← crate 名 syncui（deb 包名），lib 名 sync_ui_lib
     ├── tauri.conf.json      ← 应用配置：identifier com.syncui.app、窗口、bundle
     ├── build.rs
     ├── capabilities/

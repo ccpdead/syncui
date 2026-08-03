@@ -15,6 +15,43 @@ import {
   SyncMode,
   ConflictPolicy,
 } from "./api";
+import DiffDrawer from "./DiffDrawer";
+
+const DIFFABLE: ReadonlySet<Action> = new Set(["upload", "download", "conflict"]);
+
+function recount(entries: DiffEntry[], skippedCount: number): CompareResult {
+  const counts = {
+    uploadCount: 0,
+    downloadCount: 0,
+    deleteLocalCount: 0,
+    deleteRemoteCount: 0,
+    conflictCount: 0,
+    sameCount: 0,
+  };
+  for (const e of entries) {
+    switch (e.action) {
+      case "upload":
+        counts.uploadCount++;
+        break;
+      case "download":
+        counts.downloadCount++;
+        break;
+      case "deleteLocal":
+        counts.deleteLocalCount++;
+        break;
+      case "deleteRemote":
+        counts.deleteRemoteCount++;
+        break;
+      case "conflict":
+        counts.conflictCount++;
+        break;
+      case "same":
+        counts.sameCount++;
+        break;
+    }
+  }
+  return { entries, skippedCount, ...counts };
+}
 
 type Side = "local" | "remote";
 
@@ -85,6 +122,7 @@ export default function App() {
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<Side | null>(null);
+  const [diffEntry, setDiffEntry] = useState<DiffEntry | null>(null);
 
   const localRef = useRef<HTMLDivElement>(null);
   const remoteRef = useRef<HTMLDivElement>(null);
@@ -371,6 +409,36 @@ export default function App() {
   const pct =
     progress && progress.total > 0 ? Math.round((progress.index / progress.total) * 100) : 0;
 
+  const applyEntryUpdate = useCallback(
+    (relPath: string, updated: DiffEntry | null) => {
+      setResult((prev) => {
+        if (!prev) return prev;
+        const idx = prev.entries.findIndex((e) => e.relPath === relPath);
+        if (idx < 0) return prev;
+        const next = [...prev.entries];
+        if (updated == null) {
+          next.splice(idx, 1);
+        } else if (updated.action === "same") {
+          next[idx] = updated;
+        } else {
+          next[idx] = updated;
+        }
+        return recount(next, prev.skippedCount);
+      });
+      if (updated == null || updated.action === "same") {
+        setSelected((prev) => {
+          const next = new Set(prev);
+          next.delete(relPath);
+          return next;
+        });
+        setDiffEntry(null);
+      } else {
+        setDiffEntry(updated);
+      }
+    },
+    []
+  );
+
   return (
     <div className="app">
       <header className="topbar">
@@ -543,6 +611,7 @@ export default function App() {
               <span className="c-size">本地</span>
               <span className="c-size">远程</span>
               <span className="c-time">较新</span>
+              <span className="c-diff">Diff</span>
             </div>
             {changedEntries.length === 0 && <div className="empty">没有差异，两端一致 🎉</div>}
             {changedEntries.map((e) => (
@@ -551,6 +620,7 @@ export default function App() {
                 e={e}
                 checked={selected.has(e.relPath)}
                 onToggle={() => toggle(e.relPath)}
+                onDiff={DIFFABLE.has(e.action) ? () => setDiffEntry(e) : undefined}
               />
             ))}
           </div>
@@ -565,6 +635,17 @@ export default function App() {
             </div>
           ))}
         </section>
+      )}
+
+      {diffEntry && (
+        <DiffDrawer
+          entry={diffEntry}
+          localRoot={localPath}
+          remoteRoot={remotePath}
+          options={{ useHash, ignore: ignoreList, mode }}
+          onClose={() => setDiffEntry(null)}
+          onEntryUpdated={(updated) => applyEntryUpdate(diffEntry.relPath, updated)}
+        />
       )}
     </div>
   );
@@ -654,17 +735,19 @@ function DiffRow({
   e,
   checked,
   onToggle,
+  onDiff,
 }: {
   e: DiffEntry;
   checked: boolean;
   onToggle: () => void;
+  onDiff?: () => void;
 }) {
   const meta = ACTION_META[e.action];
   return (
-    <label className="row">
-      <span className="c-check">
+    <div className="row">
+      <label className="c-check">
         <input type="checkbox" checked={checked} onChange={onToggle} />
-      </span>
+      </label>
       <span className={`c-status ${meta.cls}`}>
         {meta.icon} {meta.label}
       </span>
@@ -676,6 +759,15 @@ function DiffRow({
       <span className="c-time">
         {e.newer === "local" ? "本地" : e.newer === "remote" ? "远程" : "—"}
       </span>
-    </label>
+      <span className="c-diff">
+        {onDiff ? (
+          <button type="button" className="btn diff-btn" onClick={onDiff}>
+            Diff
+          </button>
+        ) : (
+          <span className="diff-na">—</span>
+        )}
+      </span>
+    </div>
   );
 }
