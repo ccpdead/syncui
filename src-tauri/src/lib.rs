@@ -11,9 +11,30 @@ use engine::{
 use serde::Serialize;
 use settings::AppSettings;
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
-use tauri::{AppHandle, Emitter, Manager};
+use tauri::{AppHandle, Emitter, Manager, State};
+
+/// Cancel flags of the compare / sync currently running (at most one each).
+#[derive(Default)]
+struct TaskState {
+    compare: Mutex<Option<Arc<AtomicBool>>>,
+    sync: Mutex<Option<Arc<AtomicBool>>>,
+}
+
+/// Install a fresh cancel flag for a new task, replacing the previous one.
+fn begin_task(slot: &Mutex<Option<Arc<AtomicBool>>>) -> Arc<AtomicBool> {
+    let flag = Arc::new(AtomicBool::new(false));
+    *slot.lock().unwrap() = Some(flag.clone());
+    flag
+}
+
+fn cancel_task(slot: &Mutex<Option<Arc<AtomicBool>>>) {
+    if let Some(flag) = slot.lock().unwrap().as_ref() {
+        flag.store(true, Ordering::Relaxed);
+    }
+}
 
 /// Progress event emitted to the frontend while scanning directories.
 #[derive(Debug, Clone, Serialize)]
@@ -45,12 +66,14 @@ fn snapshot_path(app: &AppHandle, local: &str, remote: &str) -> Result<PathBuf, 
 #[tauri::command]
 async fn compare_dirs(
     app: AppHandle,
+    tasks: State<'_, TaskState>,
     local: String,
     remote: String,
     options: Option<CompareOptions>,
 ) -> Result<CompareResult, String> {
     let opts = options.unwrap_or_default();
     let snap_path = snapshot_path(&app, &local, &remote)?;
+    let cancel = begin_task(&tasks.compare);
     tauri::async_runtime::spawn_blocking(move || {
         let baseline = snapshot::load(&snap_path);
         let app2 = app.clone();
@@ -74,6 +97,7 @@ async fn compare_dirs(
             Path::new(&remote),
             &opts,
             &baseline,
+            &cancel,
             &mut emit,
         )
     })
@@ -81,19 +105,33 @@ async fn compare_dirs(
     .map_err(|e| format!("对比任务失败: {e}"))?
 }
 
+#[tauri::command]
+fn cancel_compare(tasks: State<'_, TaskState>) {
+    cancel_task(&tasks.compare);
+}
+
+#[tauri::command]
+fn cancel_sync(tasks: State<'_, TaskState>) {
+    cancel_task(&tasks.sync);
+}
+
 /// Apply the selected operations (parallel), emit `sync-progress` events, then
-/// rebuild the baseline snapshot from the resulting state.
+/// (two-way mode only) rebuild the baseline snapshot from the resulting state.
 #[tauri::command]
 async fn sync_entries(
     app: AppHandle,
+    tasks: State<'_, TaskState>,
     local: String,
     remote: String,
     items: Vec<SyncOp>,
     ignore: Vec<String>,
     concurrency: Option<usize>,
+    mode: Option<String>,
 ) -> Result<SyncResult, String> {
     let snap_path = snapshot_path(&app, &local, &remote)?;
     let workers = concurrency.unwrap_or(4);
+    let twoway = mode.as_deref() == Some("twoway");
+    let cancel = begin_task(&tasks.sync);
     tauri::async_runtime::spawn_blocking(move || {
         let app2 = app.clone();
         let last = Mutex::new(Instant::now());
@@ -111,12 +149,22 @@ async fn sync_entries(
             Path::new(&remote),
             &items,
             workers,
+            &cancel,
             &progress,
         );
 
-        // Refresh the baseline so the next comparison is accurate.
-        let snap = build_snapshot(Path::new(&local), Path::new(&remote), &ignore);
-        let _ = snapshot::save(&snap_path, &snap);
+        if twoway {
+            // A cancelled run keeps the previous baseline: it is still a valid
+            // ancestor of both sides, and rebuilding means two more full walks.
+            if !res.cancelled {
+                let snap = build_snapshot(Path::new(&local), Path::new(&remote), &ignore);
+                let _ = snapshot::save(&snap_path, &snap);
+            }
+        } else {
+            // One-way mirrors never read the baseline; drop it so a later
+            // switch to two-way can't trust a stale one.
+            let _ = std::fs::remove_file(&snap_path);
+        }
 
         Ok::<SyncResult, String>(res)
     })
@@ -217,9 +265,12 @@ pub fn run() {
 
     tauri::Builder::default()
         .plugin(tauri_plugin_dialog::init())
+        .manage(TaskState::default())
         .invoke_handler(tauri::generate_handler![
             compare_dirs,
+            cancel_compare,
             sync_entries,
+            cancel_sync,
             load_settings,
             save_settings,
             read_file_pair,

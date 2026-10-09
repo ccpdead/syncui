@@ -10,10 +10,17 @@ use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
 use std::io::Read;
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Mutex;
-use std::time::UNIX_EPOCH;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{mpsc, Mutex};
+use std::time::{Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
+
+/// Error returned when a compare is aborted through its cancel flag.
+pub const CANCELLED: &str = "已取消";
+
+fn is_cancelled(cancel: &AtomicBool) -> bool {
+    cancel.load(Ordering::Relaxed)
+}
 
 /// Modified-time comparison tolerance in seconds. Mounted filesystems
 /// (sftp/smb) often report slightly different mtime precision than local
@@ -116,10 +123,67 @@ fn mtime_of(meta: &fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether `rel` (a `/`-separated relative path) matches any ignore pattern.
+///
+/// - `build` / `**/build` / `build/`: any path component named exactly `build`
+///   (so `rebuild.sh` or `src/dialog.cpp` are NOT caught by `build` / `log`).
+/// - `*` and `?` glob within one name: `*.bkp`, `.~lock*`.
+/// - A pattern containing `/` matches a path anchored at the root
+///   (`slam_ws/build`), or at any depth when written as `**/a/b`.
 fn is_ignored(rel: &str, ignore: &[String]) -> bool {
-    ignore
-        .iter()
-        .any(|pat| !pat.is_empty() && rel.contains(pat.as_str()))
+    ignore.iter().any(|raw| {
+        let any_depth = raw.starts_with("**/");
+        let pat = raw.trim_start_matches("**/").trim_matches('/');
+        if pat.is_empty() {
+            return false;
+        }
+        if pat.contains('/') {
+            let pat_parts: Vec<&str> = pat.split('/').collect();
+            let rel_parts: Vec<&str> = rel.split('/').collect();
+            let matches_at = |start: usize| {
+                start + pat_parts.len() <= rel_parts.len()
+                    && pat_parts
+                        .iter()
+                        .zip(&rel_parts[start..])
+                        .all(|(p, r)| glob_match(p, r))
+            };
+            if any_depth {
+                (0..rel_parts.len()).any(matches_at)
+            } else {
+                matches_at(0)
+            }
+        } else {
+            rel.split('/').any(|part| glob_match(pat, part))
+        }
+    })
+}
+
+/// Match one path component against a pattern with `*` (any run) and `?`
+/// (one char) wildcards; everything else is literal.
+fn glob_match(pat: &str, name: &str) -> bool {
+    if !pat.contains(['*', '?']) {
+        return pat == name;
+    }
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 fn mtime_close(a: i64, b: i64) -> bool {
@@ -133,6 +197,7 @@ fn mtime_close(a: i64, b: i64) -> bool {
 fn scan(
     root: &Path,
     ignore: &[String],
+    cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
 ) -> Result<(BTreeMap<String, FileMeta>, usize), String> {
     let mut map = BTreeMap::new();
@@ -153,6 +218,9 @@ fn scan(
 
     let mut seen = 0usize;
     for entry in walker {
+        if is_cancelled(cancel) {
+            return Err(CANCELLED.into());
+        }
         let entry = match entry {
             Ok(e) => e,
             Err(_) => {
@@ -203,11 +271,14 @@ fn scan(
 }
 
 /// Compute a blake3 hash of a file's contents (chunked, low memory).
-fn hash_file(path: &Path) -> Result<String, String> {
+fn hash_file(path: &Path, cancel: &AtomicBool) -> Result<String, String> {
     let mut file = fs::File::open(path).map_err(|e| format!("打开文件失败: {e}"))?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = [0u8; 64 * 1024];
     loop {
+        if is_cancelled(cancel) {
+            return Err(CANCELLED.into());
+        }
         let n = file.read(&mut buf).map_err(|e| format!("读取文件失败: {e}"))?;
         if n == 0 {
             break;
@@ -219,7 +290,12 @@ fn hash_file(path: &Path) -> Result<String, String> {
 
 /// Hash a file, reusing the baseline's stored hash when size+mtime match
 /// (incremental cache — avoids re-reading unchanged files over the network).
-fn hash_cached(path: &Path, meta: &FileMeta, base: Option<&SnapEntry>) -> Option<String> {
+fn hash_cached(
+    path: &Path,
+    meta: &FileMeta,
+    base: Option<&SnapEntry>,
+    cancel: &AtomicBool,
+) -> Option<String> {
     if let Some(b) = base {
         if b.size == meta.size && mtime_close(b.mtime, meta.mtime) {
             if let Some(h) = &b.hash {
@@ -227,7 +303,7 @@ fn hash_cached(path: &Path, meta: &FileMeta, base: Option<&SnapEntry>) -> Option
             }
         }
     }
-    hash_file(path).ok()
+    hash_file(path, cancel).ok()
 }
 
 /// Whether the local and remote files have identical content.
@@ -238,6 +314,7 @@ fn same_content(
     r: &FileMeta,
     use_hash: bool,
     base: Option<&SnapEntry>,
+    cancel: &AtomicBool,
 ) -> bool {
     if l.size != r.size {
         return false;
@@ -248,7 +325,7 @@ fn same_content(
     if !use_hash {
         return false;
     }
-    match (hash_cached(lp, l, base), hash_cached(rp, r, base)) {
+    match (hash_cached(lp, l, base, cancel), hash_cached(rp, r, base, cancel)) {
         (Some(a), Some(b)) => a == b,
         _ => false,
     }
@@ -275,21 +352,47 @@ fn newer_of(l: Option<&FileMeta>, r: Option<&FileMeta>) -> Option<String> {
 /// baseline => behaves as a plain two-way / mirror compare).
 #[allow(dead_code)]
 pub fn compare(local: &Path, remote: &Path, opts: &CompareOptions) -> Result<CompareResult, String> {
-    compare_with_progress(local, remote, opts, &Snapshot::default(), &mut |_, _| {})
+    let cancel = AtomicBool::new(false);
+    compare_with_progress(local, remote, opts, &Snapshot::default(), &cancel, &mut |_, _| {})
 }
 
 /// Compare two directory trees against a baseline snapshot and produce a
-/// structured diff. `progress(phase, count)` is called periodically during
-/// scanning ("local"/"remote").
+/// structured diff of the entries that need attention; identical files are
+/// only counted (`same_count`). `progress(phase, count)` is called
+/// periodically during scanning ("local"/"remote"). Returns `Err(CANCELLED)`
+/// as soon as `cancel` is set.
 pub fn compare_with_progress(
     local: &Path,
     remote: &Path,
     opts: &CompareOptions,
     baseline: &Snapshot,
+    cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str, usize),
 ) -> Result<CompareResult, String> {
-    let (local_map, local_skipped) = scan(local, &opts.ignore, &mut |n| progress("local", n))?;
-    let (remote_map, remote_skipped) = scan(remote, &opts.ignore, &mut |n| progress("remote", n))?;
+    let started = Instant::now();
+    // Both walks are independent and usually bound by different devices (a
+    // local disk vs. a network mount), so run them concurrently.
+    let ((local_map, local_skipped), local_ms, (remote_map, remote_skipped), remote_ms) =
+        std::thread::scope(|s| -> Result<_, String> {
+            let (tx, rx) = mpsc::channel::<(&'static str, usize)>();
+            let walk = |root: &Path, phase: &'static str, tx: mpsc::Sender<(&'static str, usize)>| {
+                let t = Instant::now();
+                let res = scan(root, &opts.ignore, cancel, &mut |n| {
+                    let _ = tx.send((phase, n));
+                });
+                (res, t.elapsed().as_millis())
+            };
+            let local_tx = tx.clone();
+            let local_worker = s.spawn(move || walk(local, "local", local_tx));
+            let remote_worker = s.spawn(move || walk(remote, "remote", tx));
+            for (phase, n) in rx {
+                progress(phase, n);
+            }
+            let (l, lms) = local_worker.join().map_err(|_| "本地扫描线程异常退出".to_string())?;
+            let (r, rms) = remote_worker.join().map_err(|_| "远程扫描线程异常退出".to_string())?;
+            Ok((l?, lms, r?, rms))
+        })?;
+    let decide_started = Instant::now();
 
     let twoway = opts.mode == "twoway";
     let mirror_pull = opts.mode == "mirror_pull";
@@ -307,6 +410,9 @@ pub fn compare_with_progress(
     let mut counts = [0usize; 6]; // upload, download, delLocal, delRemote, conflict, same
 
     for rel in keys {
+        if is_cancelled(cancel) {
+            return Err(CANCELLED.into());
+        }
         let l = local_map.get(rel);
         let r = remote_map.get(rel);
         let b = baseline.files.get(rel);
@@ -314,11 +420,11 @@ pub fn compare_with_progress(
         let rp = remote.join(rel);
 
         let action = if twoway {
-            decide_twoway(&lp, l, &rp, r, b, opts.use_hash)
+            decide_twoway(&lp, l, &rp, r, b, opts.use_hash, cancel)
         } else if mirror_pull {
-            decide_mirror_pull(&lp, l, &rp, r, opts.use_hash, b)
+            decide_mirror_pull(&lp, l, &rp, r, opts.use_hash, b, cancel)
         } else {
-            decide_mirror(&lp, l, &rp, r, opts.use_hash, b)
+            decide_mirror(&lp, l, &rp, r, opts.use_hash, b, cancel)
         };
 
         let action = match action {
@@ -332,7 +438,10 @@ pub fn compare_with_progress(
             Action::DeleteLocal => counts[2] += 1,
             Action::DeleteRemote => counts[3] += 1,
             Action::Conflict => counts[4] += 1,
-            Action::Same => counts[5] += 1,
+            Action::Same => {
+                counts[5] += 1;
+                continue;
+            }
         }
 
         entries.push(DiffEntry {
@@ -361,6 +470,21 @@ pub fn compare_with_progress(
             .cmp(&rank(&b.action))
             .then_with(|| a.rel_path.cmp(&b.rel_path))
     });
+    if is_cancelled(cancel) {
+        return Err(CANCELLED.into());
+    }
+
+    eprintln!(
+        "[syncui compare] local={} remote={} changed={} same={} local_scan_ms={} remote_scan_ms={} decide_ms={} total_ms={}",
+        local_map.len(),
+        remote_map.len(),
+        entries.len(),
+        counts[5],
+        local_ms,
+        remote_ms,
+        decide_started.elapsed().as_millis(),
+        started.elapsed().as_millis(),
+    );
 
     Ok(CompareResult {
         entries,
@@ -382,10 +506,11 @@ fn decide_mirror(
     r: Option<&FileMeta>,
     use_hash: bool,
     base: Option<&SnapEntry>,
+    cancel: &AtomicBool,
 ) -> Option<Action> {
     match (l, r) {
         (Some(l), Some(r)) => {
-            if same_content(lp, l, rp, r, use_hash, base) {
+            if same_content(lp, l, rp, r, use_hash, base, cancel) {
                 Some(Action::Same)
             } else {
                 Some(Action::Upload)
@@ -405,10 +530,11 @@ fn decide_mirror_pull(
     r: Option<&FileMeta>,
     use_hash: bool,
     base: Option<&SnapEntry>,
+    cancel: &AtomicBool,
 ) -> Option<Action> {
     match (l, r) {
         (Some(l), Some(r)) => {
-            if same_content(lp, l, rp, r, use_hash, base) {
+            if same_content(lp, l, rp, r, use_hash, base, cancel) {
                 Some(Action::Same)
             } else {
                 Some(Action::Download)
@@ -428,10 +554,11 @@ fn decide_twoway(
     r: Option<&FileMeta>,
     b: Option<&SnapEntry>,
     use_hash: bool,
+    cancel: &AtomicBool,
 ) -> Option<Action> {
     match (l, r) {
         (Some(l), Some(r)) => {
-            if same_content(lp, l, rp, r, use_hash, b) {
+            if same_content(lp, l, rp, r, use_hash, b, cancel) {
                 return Some(Action::Same);
             }
             let lc = changed_from_baseline(l, b);
@@ -560,6 +687,11 @@ pub struct SyncResult {
     pub skipped: usize,
     pub failed: usize,
     pub errors: Vec<String>,
+    /// True when the run was stopped through its cancel flag before every op ran.
+    pub cancelled: bool,
+    /// Relative paths whose op succeeded; only filled for cancelled runs so the
+    /// UI can update its diff list without a full re-compare.
+    pub done_paths: Vec<String>,
 }
 
 /// Outcome of a single op: either performed, or skipped because the file
@@ -617,12 +749,14 @@ fn exec_op(local: &Path, remote: &Path, op: &SyncOp) -> Result<OpOutcome, String
 }
 
 /// Apply operations in parallel with a bounded worker pool. `progress` is
-/// invoked (from worker threads) as each op completes.
+/// invoked (from worker threads) as each op completes. Once `cancel` is set,
+/// workers finish the file they are copying and take no further ops.
 pub fn apply_ops(
     local: &Path,
     remote: &Path,
     ops: &[SyncOp],
     concurrency: usize,
+    cancel: &AtomicBool,
     progress: &(dyn Fn(OpProgress) + Sync),
 ) -> SyncResult {
     let total = ops.len();
@@ -634,6 +768,9 @@ pub fn apply_ops(
     std::thread::scope(|s| {
         for _ in 0..workers {
             s.spawn(|| loop {
+                if is_cancelled(cancel) {
+                    break;
+                }
                 let i = next.fetch_add(1, Ordering::Relaxed);
                 if i >= total {
                     break;
@@ -651,6 +788,7 @@ pub fn apply_ops(
                             "delRemote" => g.deleted_remote += 1,
                             _ => {}
                         }
+                        g.done_paths.push(op.rel_path.clone());
                         (true, false, None)
                     }
                     Ok(OpOutcome::Skipped) => {
@@ -678,7 +816,12 @@ pub fn apply_ops(
         }
     });
 
-    res.into_inner().unwrap()
+    let mut res = res.into_inner().unwrap();
+    res.cancelled = done.load(Ordering::Relaxed) < total;
+    if !res.cancelled {
+        res.done_paths = Vec::new();
+    }
+    res
 }
 
 /// Rebuild a baseline snapshot from the *current* state of both sides: record
@@ -686,10 +829,11 @@ pub fn apply_ops(
 /// the next comparison has an accurate baseline.
 pub fn build_snapshot(local: &Path, remote: &Path, ignore: &[String]) -> Snapshot {
     let mut noop = |_: usize| {};
-    let local_map = scan(local, ignore, &mut noop)
+    let never = AtomicBool::new(false);
+    let local_map = scan(local, ignore, &never, &mut noop)
         .map(|(m, _)| m)
         .unwrap_or_default();
-    let remote_map = scan(remote, ignore, &mut noop)
+    let remote_map = scan(remote, ignore, &never, &mut noop)
         .map(|(m, _)| m)
         .unwrap_or_default();
 
@@ -922,12 +1066,13 @@ pub fn compare_one(
 
     let twoway = opts.mode == "twoway";
     let mirror_pull = opts.mode == "mirror_pull";
+    let never = AtomicBool::new(false);
     let action = if twoway {
-        decide_twoway(&lp, l.as_ref(), &rp, r.as_ref(), b, opts.use_hash)
+        decide_twoway(&lp, l.as_ref(), &rp, r.as_ref(), b, opts.use_hash, &never)
     } else if mirror_pull {
-        decide_mirror_pull(&lp, l.as_ref(), &rp, r.as_ref(), opts.use_hash, b)
+        decide_mirror_pull(&lp, l.as_ref(), &rp, r.as_ref(), opts.use_hash, b, &never)
     } else {
-        decide_mirror(&lp, l.as_ref(), &rp, r.as_ref(), opts.use_hash, b)
+        decide_mirror(&lp, l.as_ref(), &rp, r.as_ref(), opts.use_hash, b, &never)
     };
 
     let action = match action {
@@ -1059,7 +1204,7 @@ mod tests {
         }
 
         let res =
-            compare_with_progress(&local, &remote, &opts("twoway"), &base, &mut |_, _| {}).unwrap();
+            compare_with_progress(&local, &remote, &opts("twoway"), &base, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
 
         // local-deleted + remote-unchanged baseline file -> delete remote
         assert_eq!(find(&res, "gone.txt").action, Action::DeleteRemote);
@@ -1089,7 +1234,7 @@ mod tests {
         );
 
         let res =
-            compare_with_progress(&local, &remote, &opts("twoway"), &base, &mut |_, _| {}).unwrap();
+            compare_with_progress(&local, &remote, &opts("twoway"), &base, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
         assert_eq!(find(&res, "f.txt").action, Action::Conflict);
 
         fs::remove_dir_all(&local).ok();
@@ -1113,7 +1258,7 @@ mod tests {
                 op: "download".into(),
             },
         ];
-        let res = apply_ops(&local, &remote, &ops, 4, &|_p| {});
+        let res = apply_ops(&local, &remote, &ops, 4, &AtomicBool::new(false), &|_p| {});
         assert_eq!(res.uploaded, 1);
         assert_eq!(res.downloaded, 1);
         assert_eq!(res.failed, 0);
@@ -1221,10 +1366,99 @@ mod tests {
             rel_path: "ghost.txt".into(),
             op: "upload".into(),
         }];
-        let res = apply_ops(&local, &remote, &ops, 2, &|_p| {});
+        let res = apply_ops(&local, &remote, &ops, 2, &AtomicBool::new(false), &|_p| {});
         assert_eq!(res.uploaded, 0);
         assert_eq!(res.failed, 0);
         assert_eq!(res.skipped, 1);
+        assert!(!res.cancelled);
+
+        fs::remove_dir_all(&local).ok();
+        fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    fn ignore_matches_whole_names_and_globs() {
+        let ig = |pats: &[&str]| pats.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let user = ig(&["__pycache__", ".trash", "**/build", "**/log", "**/install"]);
+        assert!(is_ignored("slam_ws/build", &user));
+        assert!(is_ignored("slam_ws/build/pkg/CMakeCache.txt", &user));
+        assert!(is_ignored("slam_ws/log/latest", &user));
+        assert!(is_ignored("slam_ws/install", &user));
+        assert!(is_ignored("a/__pycache__/x.pyc", &user));
+        // Substrings of a name must not match.
+        assert!(!is_ignored("slam_ws/src/dialog.cpp", &user));
+        assert!(!is_ignored("slam_ws/rebuild.sh", &user));
+        assert!(!is_ignored("slam_ws/src/install_deps.md", &user));
+
+        assert!(is_ignored("build", &ig(&["build/"])));
+        assert!(is_ignored("x/.$a.drawio.bkp", &ig(&["*.bkp"])));
+        assert!(!is_ignored("x/a.bkp.txt", &ig(&["*.bkp"])));
+        assert!(is_ignored("f1.txt", &ig(&["f?.txt"])));
+
+        let anchored = ig(&["slam_ws/build"]);
+        assert!(is_ignored("slam_ws/build/a", &anchored));
+        assert!(!is_ignored("other/slam_ws/build/a", &anchored));
+        assert!(is_ignored("other/slam_ws/build/a", &ig(&["**/slam_ws/build"])));
+    }
+
+    #[test]
+    fn compare_omits_same_entries_but_counts_them() {
+        let local = tmp_dir("same_local");
+        let remote = tmp_dir("same_remote");
+        write(&local, "same.txt", "hello");
+        fs::copy(local.join("same.txt"), remote.join("same.txt")).unwrap();
+        mirror_mtime(&local.join("same.txt"), &remote.join("same.txt"));
+        write(&local, "new.txt", "fresh");
+
+        let res = compare(&local, &remote, &opts("mirror")).unwrap();
+        assert_eq!(res.same_count, 1);
+        assert_eq!(res.upload_count, 1);
+        assert!(res.entries.iter().all(|e| e.action != Action::Same));
+        assert_eq!(res.entries.len(), 1);
+
+        fs::remove_dir_all(&local).ok();
+        fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    fn cancelled_compare_returns_error() {
+        let local = tmp_dir("cc_local");
+        let remote = tmp_dir("cc_remote");
+        write(&local, "a.txt", "a");
+
+        let cancel = AtomicBool::new(true);
+        let res = compare_with_progress(
+            &local,
+            &remote,
+            &opts("mirror"),
+            &Snapshot::default(),
+            &cancel,
+            &mut |_, _| {},
+        );
+        assert_eq!(res.unwrap_err(), CANCELLED);
+
+        fs::remove_dir_all(&local).ok();
+        fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    fn cancelled_apply_ops_runs_nothing() {
+        let local = tmp_dir("ca_local");
+        let remote = tmp_dir("ca_remote");
+        write(&local, "a.txt", "a");
+        write(&local, "b.txt", "b");
+        let ops: Vec<SyncOp> = ["a.txt", "b.txt"]
+            .iter()
+            .map(|r| SyncOp {
+                rel_path: r.to_string(),
+                op: "upload".into(),
+            })
+            .collect();
+
+        let res = apply_ops(&local, &remote, &ops, 2, &AtomicBool::new(true), &|_p| {});
+        assert!(res.cancelled);
+        assert_eq!(res.uploaded, 0);
+        assert!(!remote.join("a.txt").exists());
 
         fs::remove_dir_all(&local).ok();
         fs::remove_dir_all(&remote).ok();

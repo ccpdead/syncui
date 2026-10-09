@@ -49,7 +49,10 @@
 - **原子写入**：复制采用临时文件 + 原子重命名，保留源 mtime，保证幂等。
 - **哈希校验**：可选 BLAKE3 内容哈希，精确判断文件是否真正变更。
 - **并行执行**：有界 worker 池并发同步，并发数可调（默认 4）。
-- **忽略规则**：逗号分隔的名称列表，自动剪枝 `.git`、`node_modules` 等。
+- **忽略规则**：逗号分隔，被忽略的目录在扫描时直接剪枝，不会进入：
+  - `build`、`**/build`、`build/`：任意层级中名字**恰好**是 `build` 的目录或文件（`rebuild.sh` 不受影响）。
+  - `*.bkp`、`f?.txt`：`*` / `?` 通配单个名字。
+  - `slam_ws/build`：从对比根目录起的路径；写成 `**/slam_ws/build` 则匹配任意层级。
 
 ---
 
@@ -182,23 +185,27 @@ Linux 产出 `.deb` 和 `.AppImage`：
 
 ```text
 src-tauri/target/release/bundle/
-├── deb/    ← SyncUI_0.1.0_amd64.deb（包名 syncui）
-└── appimage/  ← SyncUI_0.1.0_amd64.AppImage
+├── deb/    ← syncui_0.1.0_amd64.deb（包名 syncui）
+└── appimage/  ← syncui_0.1.0_amd64.AppImage
 ```
 
-安装 `.deb`（包名必须是 `syncui`，不要用 `sync-ui`——后者是 Ubuntu 官方 SyncEvolution 包，会被 apt 覆盖）：
+安装 `.deb`。包名必须是 `syncui`，不能是 `sync-ui`：后者是 Ubuntu 官方 SyncEvolution 的图形界面（中文名"同步"），
+`unattended-upgrades` 会把同名的 0.1.0 当旧版本"升级"成官方 2.0.0-3，重启后打开的就变成"同步"。
+Debian 包名由 Tauri 的 `productName` 生成，`src-tauri/tauri.linux.conf.json` 已把它覆盖为 `syncui`，
+`build-release.sh` 打包后也会校验包名。
 
 ```bash
-# 若以前装过错误包名的 SyncUI，先卸掉，避免与官方 sync-ui 纠缠
-sudo dpkg -r sync-ui 2>/dev/null || true
-sudo dpkg -i src-tauri/target/release/bundle/deb/SyncUI_*.deb
+# 若以前装过 sync-ui（无论是旧版 SyncUI 还是被替换成的 SyncEvolution），先彻底卸掉
+sudo apt purge sync-ui
+sudo apt autoremove        # 顺带清理 syncevolution-* 依赖
+sudo apt install ./src-tauri/target/release/bundle/deb/syncui_*.deb
 ```
 
 或直接运行 AppImage（无需安装）：
 
 ```bash
-chmod +x src-tauri/target/release/bundle/appimage/SyncUI_*.AppImage
-./src-tauri/target/release/bundle/appimage/SyncUI_*.AppImage
+chmod +x src-tauri/target/release/bundle/appimage/syncui_*.AppImage
+./src-tauri/target/release/bundle/appimage/syncui_*.AppImage
 ```
 
 ---

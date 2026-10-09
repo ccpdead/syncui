@@ -13,6 +13,17 @@ export type TreeNode = {
 
 export type ActionMeta = { label: string; icon: string; cls: string };
 
+type FlatRow = { node: TreeNode; depth: number };
+
+/** Must match `.tree-row` height in styles.css (rows are virtualized). */
+const ROW_HEIGHT = 28;
+const OVERSCAN = 10;
+
+const byName = (a: { kind: string; name: string }, b: { kind: string; name: string }) => {
+  if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1;
+  return a.name < b.name ? -1 : a.name > b.name ? 1 : 0;
+};
+
 /** Build a directory tree from relative file paths. */
 export function buildSelectionTree(relPaths: string[]): TreeNode[] {
   type Mutable = {
@@ -31,8 +42,10 @@ export function buildSelectionTree(relPaths: string[]): TreeNode[] {
     filePaths: [],
   };
 
-  const sorted = [...relPaths].sort((a, b) => a.localeCompare(b));
-  for (const rel of sorted) {
+  const seen = new Set<string>();
+  for (const rel of relPaths) {
+    if (seen.has(rel)) continue;
+    seen.add(rel);
     const parts = rel.split("/").filter(Boolean);
     if (parts.length === 0) continue;
 
@@ -69,9 +82,7 @@ export function buildSelectionTree(relPaths: string[]): TreeNode[] {
         chain.push(node);
       }
     }
-    for (const n of chain) {
-      if (!n.filePaths.includes(rel)) n.filePaths.push(rel);
-    }
+    for (const n of chain) n.filePaths.push(rel);
   }
 
   const freeze = (m: Mutable): TreeNode => ({
@@ -79,20 +90,10 @@ export function buildSelectionTree(relPaths: string[]): TreeNode[] {
     name: m.name,
     kind: m.kind,
     filePaths: m.filePaths,
-    children: [...m.children.values()]
-      .sort((a, b) => {
-        if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1;
-        return a.name.localeCompare(b.name);
-      })
-      .map(freeze),
+    children: [...m.children.values()].sort(byName).map(freeze),
   });
 
-  return [...root.children.values()]
-    .sort((a, b) => {
-      if (a.kind !== b.kind) return a.kind === "dir" ? -1 : 1;
-      return a.name.localeCompare(b.name);
-    })
-    .map(freeze);
+  return [...root.children.values()].sort(byName).map(freeze);
 }
 
 function collectDirPaths(nodes: TreeNode[], out: string[] = []): string[] {
@@ -103,6 +104,19 @@ function collectDirPaths(nodes: TreeNode[], out: string[] = []): string[] {
     }
   }
   return out;
+}
+
+/** Rows currently visible given the expanded directories, in display order. */
+function flattenVisible(nodes: TreeNode[], expanded: Set<string>): FlatRow[] {
+  const rows: FlatRow[] = [];
+  const visit = (items: TreeNode[], depth: number) => {
+    for (const node of items) {
+      rows.push({ node, depth });
+      if (node.kind === "dir" && expanded.has(node.path)) visit(node.children, depth + 1);
+    }
+  };
+  visit(nodes, 0);
+  return rows;
 }
 
 function fmtSize(n: number | null): string {
@@ -146,6 +160,7 @@ function TreeRow({
   expanded,
   activePath,
   entryByPath,
+  selectedCounts,
   actionMeta,
   diffable,
   onToggleExpand,
@@ -159,6 +174,7 @@ function TreeRow({
   expanded: Set<string>;
   activePath: string | null;
   entryByPath: Map<string, DiffEntry>;
+  selectedCounts: Map<string, number>;
   actionMeta: Record<Action, ActionMeta>;
   diffable: Set<string>;
   onToggleExpand: (path: string) => void;
@@ -219,53 +235,30 @@ function TreeRow({
   }
 
   const total = node.filePaths.length;
-  const sel = node.filePaths.reduce((n, p) => n + (selected.has(p) ? 1 : 0), 0);
+  const sel = selectedCounts.get(node.path) ?? 0;
   const state: "all" | "none" | "part" =
     total === 0 ? "none" : sel === 0 ? "none" : sel === total ? "all" : "part";
   const isOpen = expanded.has(node.path);
 
   return (
-    <div className="tree-branch">
-      <div className="tree-row dir" style={{ paddingLeft: 8 + depth * 14 }}>
-        <button
-          type="button"
-          className="tree-twist"
-          onClick={() => onToggleExpand(node.path)}
-          aria-label={isOpen ? "折叠" : "展开"}
-        >
-          {isOpen ? "▾" : "▸"}
-        </button>
-        <label className="tree-label">
-          <CheckBox
-            state={state}
-            onChange={() => onToggleDir(node.filePaths, state !== "all")}
-          />
-          <span className="tree-dir" title={node.path}>
-            {node.name}
-            <span className="tree-count">
-              {sel}/{total}
-            </span>
+    <div className="tree-row dir" style={{ paddingLeft: 8 + depth * 14 }}>
+      <button
+        type="button"
+        className="tree-twist"
+        onClick={() => onToggleExpand(node.path)}
+        aria-label={isOpen ? "折叠" : "展开"}
+      >
+        {isOpen ? "▾" : "▸"}
+      </button>
+      <label className="tree-label">
+        <CheckBox state={state} onChange={() => onToggleDir(node.filePaths, state !== "all")} />
+        <span className="tree-dir" title={node.path}>
+          {node.name}
+          <span className="tree-count">
+            {sel}/{total}
           </span>
-        </label>
-      </div>
-      {isOpen &&
-        node.children.map((c) => (
-          <TreeRow
-            key={c.path}
-            node={c}
-            depth={depth + 1}
-            selected={selected}
-            expanded={expanded}
-            activePath={activePath}
-            entryByPath={entryByPath}
-            actionMeta={actionMeta}
-            diffable={diffable}
-            onToggleExpand={onToggleExpand}
-            onToggleFile={onToggleFile}
-            onToggleDir={onToggleDir}
-            onDiff={onDiff}
-          />
-        ))}
+        </span>
+      </label>
     </div>
   );
 }
@@ -298,13 +291,49 @@ export default function SelectionTree({
   }, [entries]);
 
   const roots = useMemo(() => buildSelectionTree(relPaths), [relPaths]);
-  const allDirsKey = useMemo(() => collectDirPaths(roots).join("\0"), [roots]);
-  const [expanded, setExpanded] = useState<Set<string>>(() => new Set(collectDirPaths(roots)));
+  const allDirPaths = useMemo(() => collectDirPaths(roots), [roots]);
+  const [expanded, setExpanded] = useState<Set<string>>(() => new Set());
+  const [scrollTop, setScrollTop] = useState(0);
+  const [viewportHeight, setViewportHeight] = useState(400);
+  const bodyRef = useRef<HTMLDivElement>(null);
 
-  // Default: expand all when the tree structure changes (filter / compare).
+  // Start collapsed whenever the tree is rebuilt (new compare / filter):
+  // expanding tens of thousands of rows up front is what froze the WebView.
   useEffect(() => {
-    setExpanded(new Set(collectDirPaths(roots)));
-  }, [allDirsKey, roots]);
+    setExpanded(new Set());
+    setScrollTop(0);
+    if (bodyRef.current) bodyRef.current.scrollTop = 0;
+  }, [roots]);
+
+  const isEmpty = relPaths.length === 0;
+  useEffect(() => {
+    const body = bodyRef.current;
+    if (!body) return;
+    setViewportHeight(body.clientHeight);
+    const observer = new ResizeObserver(() => setViewportHeight(body.clientHeight));
+    observer.observe(body);
+    return () => observer.disconnect();
+  }, [isEmpty]);
+
+  /** Selected-file count per directory path, computed once per selection change. */
+  const selectedCounts = useMemo(() => {
+    const counts = new Map<string, number>();
+    for (const rel of selected) {
+      if (!entryByPath.has(rel)) continue;
+      let slash = rel.lastIndexOf("/");
+      while (slash > 0) {
+        const dir = rel.slice(0, slash);
+        counts.set(dir, (counts.get(dir) ?? 0) + 1);
+        slash = rel.lastIndexOf("/", slash - 1);
+      }
+    }
+    return counts;
+  }, [selected, entryByPath]);
+
+  const rows = useMemo(() => flattenVisible(roots, expanded), [roots, expanded]);
+  const start = Math.max(0, Math.floor(scrollTop / ROW_HEIGHT) - OVERSCAN);
+  const end = Math.min(rows.length, Math.ceil((scrollTop + viewportHeight) / ROW_HEIGHT) + OVERSCAN);
+  const visibleRows = rows.slice(start, end);
 
   const toggleExpand = (path: string) => {
     setExpanded((prev) => {
@@ -315,7 +344,7 @@ export default function SelectionTree({
     });
   };
 
-  if (relPaths.length === 0) {
+  if (isEmpty) {
     return <div className="tree-empty">当前筛选无文件</div>;
   }
 
@@ -323,27 +352,29 @@ export default function SelectionTree({
     <div className="selection-tree">
       <div className="tree-toolbar">
         <span className="tree-title">按目录选择</span>
-        <button
-          type="button"
-          className="link"
-          onClick={() => setExpanded(new Set(collectDirPaths(roots)))}
-        >
+        <button type="button" className="link" onClick={() => setExpanded(new Set(allDirPaths))}>
           全展开
         </button>
         <button type="button" className="link" onClick={() => setExpanded(new Set())}>
           全折叠
         </button>
       </div>
-      <div className="tree-body">
-        {roots.map((n) => (
+      <div
+        className="tree-body"
+        ref={bodyRef}
+        onScroll={(e) => setScrollTop(e.currentTarget.scrollTop)}
+      >
+        <div style={{ height: start * ROW_HEIGHT }} />
+        {visibleRows.map(({ node, depth }) => (
           <TreeRow
-            key={n.path}
-            node={n}
-            depth={0}
+            key={node.path}
+            node={node}
+            depth={depth}
             selected={selected}
             expanded={expanded}
             activePath={activePath}
             entryByPath={entryByPath}
+            selectedCounts={selectedCounts}
             actionMeta={actionMeta}
             diffable={diffable}
             onToggleExpand={toggleExpand}
@@ -352,6 +383,7 @@ export default function SelectionTree({
             onDiff={onDiff}
           />
         ))}
+        <div style={{ height: (rows.length - end) * ROW_HEIGHT }} />
       </div>
     </div>
   );

@@ -398,7 +398,9 @@ body {
   display: flex;
   align-items: center;
   gap: 4px;
-  min-height: 28px;
+  /* Fixed: SelectionTree virtualizes rows using ROW_HEIGHT = 28. */
+  height: 28px;
+  box-sizing: border-box;
   padding-right: 8px;
 }
 .tree-row:hover {
@@ -449,6 +451,9 @@ body {
 .tree-dir {
   color: var(--text);
   font-weight: 600;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
 }
 .tree-file {
   color: var(--muted);
@@ -648,6 +653,22 @@ body {
 }
 .scan-hint {
   color: var(--muted);
+  font-size: 12px;
+}
+.scanning .cancel-btn {
+  margin-left: auto;
+}
+.progress-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+}
+.progress-row .progress {
+  flex: 1;
+}
+.cancel-btn {
+  flex: none;
+  padding: 4px 12px;
   font-size: 12px;
 }
 .spinner {

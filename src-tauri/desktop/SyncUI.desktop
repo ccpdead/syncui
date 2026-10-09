@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=SyncUI
+Comment=目录对比与同步
+Exec={{{exec}}}
+Icon={{{icon}}}
+Categories=Utility;FileTools;
+Terminal=false

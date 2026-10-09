@@ -5,6 +5,9 @@ import { open } from "@tauri-apps/plugin-dialog";
 import {
   compareDirs,
   syncEntries,
+  cancelCompare,
+  cancelSync,
+  CANCELLED,
   loadSettings,
   saveSettings,
   CompareResult,
@@ -20,14 +23,16 @@ import SelectionTree from "./SelectionTree";
 
 const DIFFABLE: ReadonlySet<Action> = new Set(["upload", "download", "conflict"]);
 
-function recount(entries: DiffEntry[], skippedCount: number): CompareResult {
+/** Rebuild the per-action counts; `sameCount` is carried over because
+ * identical files are not part of `entries`. */
+function recount(entries: DiffEntry[], skippedCount: number, sameCount: number): CompareResult {
   const counts = {
     uploadCount: 0,
     downloadCount: 0,
     deleteLocalCount: 0,
     deleteRemoteCount: 0,
     conflictCount: 0,
-    sameCount: 0,
+    sameCount,
   };
   for (const e of entries) {
     switch (e.action) {
@@ -103,10 +108,12 @@ export default function App() {
   const [result, setResult] = useState<CompareResult | null>(null);
   const [selected, setSelected] = useState<Set<string>>(new Set());
   const [comparing, setComparing] = useState(false);
-  const [scanProgress, setScanProgress] = useState<{ phase: string; count: number } | null>(
+  const [scanProgress, setScanProgress] = useState<{ local: number; remote: number } | null>(
     null
   );
   const [syncing, setSyncing] = useState(false);
+  /** A cancel request was sent for the running compare / sync. */
+  const [cancelling, setCancelling] = useState(false);
   const [progress, setProgress] = useState<SyncProgress | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
@@ -121,6 +128,8 @@ export default function App() {
 
   const localRef = useRef<HTMLDivElement>(null);
   const remoteRef = useRef<HTMLDivElement>(null);
+  /** performance.now() when a compare result was handed to React. */
+  const resultAtRef = useRef<number | null>(null);
 
   const pushLog = useCallback((line: string) => {
     setLog((prev) => [...prev.slice(-300), line]);
@@ -270,7 +279,11 @@ export default function App() {
       pushLog(`${mark} [${p.index}/${p.total}] ${verb} ${p.relPath}${tail}`);
     }).then((fn) => (unlistenSync = fn));
     listen<{ phase: string; count: number }>("scan-progress", (e) => {
-      setScanProgress(e.payload);
+      const { phase, count } = e.payload;
+      // Local and remote are scanned concurrently; keep both counters.
+      setScanProgress((prev) =>
+        prev ? { ...prev, [phase === "remote" ? "remote" : "local"]: count } : prev
+      );
     }).then((fn) => (unlistenScan = fn));
     return () => {
       if (unlistenSync) unlistenSync();
@@ -309,6 +322,18 @@ export default function App() {
     }
   };
 
+  // Log how long the diff UI took to render, to spot regressions on big trees.
+  useEffect(() => {
+    const t0 = resultAtRef.current;
+    if (!result || t0 == null) return;
+    resultAtRef.current = null;
+    const raf = requestAnimationFrame(() => {
+      const ms = Math.round(performance.now() - t0);
+      pushLog(`差异界面渲染：${ms}ms，${result.entries.length} 个变更项`);
+    });
+    return () => cancelAnimationFrame(raf);
+  }, [result, pushLog]);
+
   const runCompare = async () => {
     setError(null);
     if (!localPath || !remotePath) {
@@ -316,16 +341,19 @@ export default function App() {
       return;
     }
     setComparing(true);
+    setCancelling(false);
     setResult(null);
     setSelected(new Set());
     setActionFilter("all");
-    setScanProgress({ phase: "local", count: 0 });
+    setDiffEntry(null);
+    setScanProgress({ local: 0, remote: 0 });
     try {
       const res = await compareDirs(localPath, remotePath, {
         useHash,
         ignore: ignoreList,
         mode,
       });
+      resultAtRef.current = performance.now();
       setResult(res);
       // Right pane only lists tree selection — start empty so user picks via the tree.
       setSelected(new Set());
@@ -335,11 +363,18 @@ export default function App() {
           (res.skippedCount ? ` 跳过${res.skippedCount}` : "")
       );
     } catch (e) {
-      setError(String(e));
+      if (String(e) === CANCELLED) pushLog("对比已取消");
+      else setError(String(e));
     } finally {
       setComparing(false);
+      setCancelling(false);
       setScanProgress(null);
     }
+  };
+
+  const requestCancel = (kind: "compare" | "sync") => {
+    setCancelling(true);
+    (kind === "compare" ? cancelCompare() : cancelSync()).catch((e) => setError(String(e)));
   };
 
   const toggle = (rel: string) => {
@@ -362,10 +397,13 @@ export default function App() {
     });
   };
 
-  const changedEntries = useMemo(
-    () => (result ? result.entries.filter((e) => e.action !== "same") : []),
-    [result]
-  );
+  // The backend only returns entries that need attention (no "same").
+  const changedEntries = useMemo(() => result?.entries ?? [], [result]);
+  const changedByPath = useMemo(() => {
+    const m = new Map<string, DiffEntry>();
+    for (const e of changedEntries) m.set(e.relPath, e);
+    return m;
+  }, [changedEntries]);
 
   const visibleEntries = useMemo(
     () =>
@@ -373,6 +411,10 @@ export default function App() {
         ? changedEntries
         : changedEntries.filter((e) => e.action === actionFilter),
     [changedEntries, actionFilter]
+  );
+  const diffablePaths = useMemo(
+    () => new Set(visibleEntries.filter((e) => DIFFABLE.has(e.action)).map((e) => e.relPath)),
+    [visibleEntries]
   );
 
   const setAll = (on: boolean) => {
@@ -425,18 +467,37 @@ export default function App() {
     }
     setError(null);
     setSyncing(true);
+    setCancelling(false);
     setProgress(null);
     try {
-      const res = await syncEntries(localPath, remotePath, items, ignoreList, concurrency);
-      pushLog(
-        `同步结束：↑${res.uploaded} ↓${res.downloaded} 删远程${res.deletedRemote} ` +
-          `删本地${res.deletedLocal} 跳过${res.skipped} 失败${res.failed}`
-      );
-      await runCompare();
+      const res = await syncEntries(localPath, remotePath, items, ignoreList, concurrency, mode);
+      const summary =
+        `↑${res.uploaded} ↓${res.downloaded} 删远程${res.deletedRemote} ` +
+        `删本地${res.deletedLocal} 跳过${res.skipped} 失败${res.failed}`;
+      if (res.cancelled) {
+        // Skip the (possibly very slow) full re-compare: drop what was done.
+        pushLog(`同步已取消（${res.donePaths.length}/${items.length} 项已完成）：${summary}`);
+        const done = new Set(res.donePaths);
+        setResult((prev) => {
+          if (!prev) return prev;
+          const kept = prev.entries.filter((e) => !done.has(e.relPath));
+          // Copies leave both sides identical; deletions leave nothing behind.
+          const nowSame = prev.entries.filter(
+            (e) => done.has(e.relPath) && DIFFABLE.has(e.action)
+          ).length;
+          return recount(kept, prev.skippedCount, prev.sameCount + nowSame);
+        });
+        setSelected((prev) => new Set([...prev].filter((r) => !done.has(r))));
+        setDiffEntry((d) => (d && done.has(d.relPath) ? null : d));
+      } else {
+        pushLog(`同步结束：${summary}`);
+        await runCompare();
+      }
     } catch (e) {
       setError(String(e));
     } finally {
       setSyncing(false);
+      setCancelling(false);
     }
   };
 
@@ -450,14 +511,16 @@ export default function App() {
         const idx = prev.entries.findIndex((e) => e.relPath === relPath);
         if (idx < 0) return prev;
         const next = [...prev.entries];
+        let sameCount = prev.sameCount;
         if (updated == null) {
           next.splice(idx, 1);
         } else if (updated.action === "same") {
-          next[idx] = updated;
+          next.splice(idx, 1);
+          sameCount++;
         } else {
           next[idx] = updated;
         }
-        return recount(next, prev.skippedCount);
+        return recount(next, prev.skippedCount, sameCount);
       });
       if (updated == null || updated.action === "same") {
         setSelected((prev) => {
@@ -547,6 +610,12 @@ export default function App() {
             value={ignoreText}
             onChange={(e) => setIgnoreText(e.target.value)}
             placeholder=".git, node_modules"
+            title={
+              "逗号分隔，按名字整段匹配：\n" +
+              "build / **/build：任意层级名为 build 的目录\n" +
+              "*.bkp：通配符\n" +
+              "slam_ws/build：从根目录起的路径"
+            }
           />
         </label>
         <button className="btn primary" onClick={runCompare} disabled={comparing || syncing}>
@@ -559,9 +628,16 @@ export default function App() {
       {comparing && (
         <div className="scanning">
           <span className="spinner" />
-          正在扫描{scanProgress?.phase === "remote" ? "远程" : "本地"}目录… 已发现{" "}
-          <b>{scanProgress?.count ?? 0}</b> 个文件
+          正在扫描… 本地 <b>{scanProgress?.local ?? 0}</b> / 远程{" "}
+          <b>{scanProgress?.remote ?? 0}</b> 个文件
           <span className="scan-hint">（大目录请用"忽略"过滤以加速）</span>
+          <button
+            className="btn cancel-btn"
+            onClick={() => requestCancel("compare")}
+            disabled={cancelling}
+          >
+            {cancelling ? "正在停止…" : "取消对比"}
+          </button>
         </div>
       )}
 
@@ -649,9 +725,18 @@ export default function App() {
           </div>
 
           {syncing && (
-            <div className="progress">
-              <div className="bar" style={{ width: `${pct}%` }} />
-              <span className="pct">{pct}%</span>
+            <div className="progress-row">
+              <div className="progress">
+                <div className="bar" style={{ width: `${pct}%` }} />
+                <span className="pct">{pct}%</span>
+              </div>
+              <button
+                className="btn cancel-btn"
+                onClick={() => requestCancel("sync")}
+                disabled={cancelling}
+              >
+                {cancelling ? "正在停止…" : "取消同步"}
+              </button>
             </div>
           )}
 
@@ -665,15 +750,11 @@ export default function App() {
                 selected={selected}
                 activePath={diffEntry?.relPath ?? null}
                 actionMeta={ACTION_META}
-                diffable={new Set(
-                  visibleEntries.filter((e) => DIFFABLE.has(e.action)).map((e) => e.relPath)
-                )}
+                diffable={diffablePaths}
                 onToggleFile={toggle}
                 onToggleFiles={toggleFiles}
                 onDiff={(rel) => {
-                  const e =
-                    visibleEntries.find((x) => x.relPath === rel) ??
-                    changedEntries.find((x) => x.relPath === rel);
+                  const e = changedByPath.get(rel);
                   if (e) setDiffEntry(e);
                 }}
               />
