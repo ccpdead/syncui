@@ -6,6 +6,9 @@ set -e
 export WEBKIT_DISABLE_DMABUF_RENDERER=1
 export WEBKIT_DISABLE_COMPOSITING_MODE=1
 
+# rustc/LLVM can overflow its default worker stack on this toolchain (SIGILL).
+export RUST_MIN_STACK="${RUST_MIN_STACK:-16777216}"
+
 # Cap parallel rustc jobs. Release builds with LTO / codegen-units=1 are very
 # memory-hungry; default (= nproc, often 32) can trigger "rustc-LLVM ERROR: out of memory".
 if [[ -z "${CARGO_BUILD_JOBS:-}" ]]; then
@@ -33,4 +36,24 @@ if [[ ! -d node_modules ]]; then
 fi
 
 echo "Building with CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}..."
+build_marker="$(mktemp)"
+trap 'rm -f "$build_marker"' EXIT
 npm run tauri build
+
+# The .deb must never be named "sync-ui": that is Ubuntu's SyncEvolution GUI,
+# and unattended-upgrades would silently replace our app with it.
+if command -v dpkg-deb >/dev/null 2>&1; then
+  mapfile -t debs < <(find src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -newer "$build_marker")
+  if (( ${#debs[@]} == 0 )); then
+    echo "error: no freshly built .deb found." >&2
+    exit 1
+  fi
+  for deb in "${debs[@]}"; do
+    pkg="$(dpkg-deb -f "$deb" Package)"
+    if [[ "$pkg" != "syncui" ]]; then
+      echo "error: $deb declares Package: $pkg (expected syncui)." >&2
+      exit 1
+    fi
+    echo "Verified $deb: Package: syncui"
+  done
+fi

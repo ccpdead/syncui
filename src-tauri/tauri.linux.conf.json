@@ -1,0 +1,10 @@
+{
+  "productName": "syncui",
+  "bundle": {
+    "linux": {
+      "deb": {
+        "desktopTemplate": "desktop/SyncUI.desktop"
+      }
+    }
+  }
+}

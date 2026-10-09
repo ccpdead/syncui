@@ -182,23 +182,27 @@ Linux 产出 `.deb` 和 `.AppImage`：
 
 ```text
 src-tauri/target/release/bundle/
-├── deb/    ← SyncUI_0.1.0_amd64.deb（包名 syncui）
-└── appimage/  ← SyncUI_0.1.0_amd64.AppImage
+├── deb/    ← syncui_0.1.0_amd64.deb（包名 syncui）
+└── appimage/  ← syncui_0.1.0_amd64.AppImage
 ```
 
-安装 `.deb`（包名必须是 `syncui`，不要用 `sync-ui`——后者是 Ubuntu 官方 SyncEvolution 包，会被 apt 覆盖）：
+安装 `.deb`。包名必须是 `syncui`，不能是 `sync-ui`：后者是 Ubuntu 官方 SyncEvolution 的图形界面（中文名"同步"），
+`unattended-upgrades` 会把同名的 0.1.0 当旧版本"升级"成官方 2.0.0-3，重启后打开的就变成"同步"。
+Debian 包名由 Tauri 的 `productName` 生成，`src-tauri/tauri.linux.conf.json` 已把它覆盖为 `syncui`，
+`build-release.sh` 打包后也会校验包名。
 
 ```bash
-# 若以前装过错误包名的 SyncUI，先卸掉，避免与官方 sync-ui 纠缠
-sudo dpkg -r sync-ui 2>/dev/null || true
-sudo dpkg -i src-tauri/target/release/bundle/deb/SyncUI_*.deb
+# 若以前装过 sync-ui（无论是旧版 SyncUI 还是被替换成的 SyncEvolution），先彻底卸掉
+sudo apt purge sync-ui
+sudo apt autoremove        # 顺带清理 syncevolution-* 依赖
+sudo apt install ./src-tauri/target/release/bundle/deb/syncui_*.deb
 ```
 
 或直接运行 AppImage（无需安装）：
 
 ```bash
-chmod +x src-tauri/target/release/bundle/appimage/SyncUI_*.AppImage
-./src-tauri/target/release/bundle/appimage/SyncUI_*.AppImage
+chmod +x src-tauri/target/release/bundle/appimage/syncui_*.AppImage
+./src-tauri/target/release/bundle/appimage/syncui_*.AppImage
 ```
 
 ---

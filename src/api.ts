@@ -76,7 +76,14 @@ export interface SyncResult {
   skipped: number;
   failed: number;
   errors: string[];
+  /** True when the run was stopped by cancelSync() before every item ran. */
+  cancelled: boolean;
+  /** Paths synced successfully; only filled when `cancelled` is true. */
+  donePaths: string[];
 }
+
+/** Error message the backend returns for a cancelled compare. */
+export const CANCELLED = "已取消";
 
 export interface FileTextSide {
   exists: boolean;
@@ -108,7 +115,8 @@ export function syncEntries(
   remote: string,
   items: SyncOp[],
   ignore: string[],
-  concurrency: number
+  concurrency: number,
+  mode: SyncMode
 ): Promise<SyncResult> {
   return invoke<SyncResult>("sync_entries", {
     local,
@@ -116,7 +124,16 @@ export function syncEntries(
     items,
     ignore,
     concurrency,
+    mode,
   });
+}
+
+export function cancelCompare(): Promise<void> {
+  return invoke("cancel_compare");
+}
+
+export function cancelSync(): Promise<void> {
+  return invoke("cancel_sync");
 }
 
 export function loadSettings(): Promise<AppSettings> {

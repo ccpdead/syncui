@@ -1,7 +1,9 @@
 [package]
-# Debian Package name follows this crate name. Must NOT be "sync-ui" —
-# that name is taken by Ubuntu's SyncEvolution GUI (universe/sync-ui),
-# and apt will "upgrade" our 0.1.0 back to their 2.0.0-3 overnight.
+# The Debian package name is derived from Tauri's productName (kebab-cased),
+# not from this crate name. tauri.linux.conf.json overrides productName to
+# "syncui": "SyncUI" would become "sync-ui", which is Ubuntu's SyncEvolution
+# GUI (universe/sync-ui), and unattended-upgrades would replace our 0.1.0
+# with their 2.0.0-3 overnight.
 name = "syncui"
 version = "0.1.0"
 description = "Cross-platform directory sync GUI"
