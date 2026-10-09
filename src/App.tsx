@@ -610,6 +610,12 @@ export default function App() {
             value={ignoreText}
             onChange={(e) => setIgnoreText(e.target.value)}
             placeholder=".git, node_modules"
+            title={
+              "逗号分隔，按名字整段匹配：\n" +
+              "build / **/build：任意层级名为 build 的目录\n" +
+              "*.bkp：通配符\n" +
+              "slam_ws/build：从根目录起的路径"
+            }
           />
         </label>
         <button className="btn primary" onClick={runCompare} disabled={comparing || syncing}>

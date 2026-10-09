@@ -123,10 +123,67 @@ fn mtime_of(meta: &fs::Metadata) -> i64 {
         .unwrap_or(0)
 }
 
+/// Whether `rel` (a `/`-separated relative path) matches any ignore pattern.
+///
+/// - `build` / `**/build` / `build/`: any path component named exactly `build`
+///   (so `rebuild.sh` or `src/dialog.cpp` are NOT caught by `build` / `log`).
+/// - `*` and `?` glob within one name: `*.bkp`, `.~lock*`.
+/// - A pattern containing `/` matches a path anchored at the root
+///   (`slam_ws/build`), or at any depth when written as `**/a/b`.
 fn is_ignored(rel: &str, ignore: &[String]) -> bool {
-    ignore
-        .iter()
-        .any(|pat| !pat.is_empty() && rel.contains(pat.as_str()))
+    ignore.iter().any(|raw| {
+        let any_depth = raw.starts_with("**/");
+        let pat = raw.trim_start_matches("**/").trim_matches('/');
+        if pat.is_empty() {
+            return false;
+        }
+        if pat.contains('/') {
+            let pat_parts: Vec<&str> = pat.split('/').collect();
+            let rel_parts: Vec<&str> = rel.split('/').collect();
+            let matches_at = |start: usize| {
+                start + pat_parts.len() <= rel_parts.len()
+                    && pat_parts
+                        .iter()
+                        .zip(&rel_parts[start..])
+                        .all(|(p, r)| glob_match(p, r))
+            };
+            if any_depth {
+                (0..rel_parts.len()).any(matches_at)
+            } else {
+                matches_at(0)
+            }
+        } else {
+            rel.split('/').any(|part| glob_match(pat, part))
+        }
+    })
+}
+
+/// Match one path component against a pattern with `*` (any run) and `?`
+/// (one char) wildcards; everything else is literal.
+fn glob_match(pat: &str, name: &str) -> bool {
+    if !pat.contains(['*', '?']) {
+        return pat == name;
+    }
+    let p: Vec<char> = pat.chars().collect();
+    let n: Vec<char> = name.chars().collect();
+    let (mut pi, mut ni) = (0, 0);
+    let mut star: Option<(usize, usize)> = None;
+    while ni < n.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == n[ni]) {
+            pi += 1;
+            ni += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some((pi, ni));
+            pi += 1;
+        } else if let Some((sp, sn)) = star {
+            pi = sp + 1;
+            ni = sn + 1;
+            star = Some((sp, sn + 1));
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|&c| c == '*')
 }
 
 fn mtime_close(a: i64, b: i64) -> bool {
@@ -1317,6 +1374,31 @@ mod tests {
 
         fs::remove_dir_all(&local).ok();
         fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    fn ignore_matches_whole_names_and_globs() {
+        let ig = |pats: &[&str]| pats.iter().map(|s| s.to_string()).collect::<Vec<_>>();
+        let user = ig(&["__pycache__", ".trash", "**/build", "**/log", "**/install"]);
+        assert!(is_ignored("slam_ws/build", &user));
+        assert!(is_ignored("slam_ws/build/pkg/CMakeCache.txt", &user));
+        assert!(is_ignored("slam_ws/log/latest", &user));
+        assert!(is_ignored("slam_ws/install", &user));
+        assert!(is_ignored("a/__pycache__/x.pyc", &user));
+        // Substrings of a name must not match.
+        assert!(!is_ignored("slam_ws/src/dialog.cpp", &user));
+        assert!(!is_ignored("slam_ws/rebuild.sh", &user));
+        assert!(!is_ignored("slam_ws/src/install_deps.md", &user));
+
+        assert!(is_ignored("build", &ig(&["build/"])));
+        assert!(is_ignored("x/.$a.drawio.bkp", &ig(&["*.bkp"])));
+        assert!(!is_ignored("x/a.bkp.txt", &ig(&["*.bkp"])));
+        assert!(is_ignored("f1.txt", &ig(&["f?.txt"])));
+
+        let anchored = ig(&["slam_ws/build"]);
+        assert!(is_ignored("slam_ws/build/a", &anchored));
+        assert!(!is_ignored("other/slam_ws/build/a", &anchored));
+        assert!(is_ignored("other/slam_ws/build/a", &ig(&["**/slam_ws/build"])));
     }
 
     #[test]
