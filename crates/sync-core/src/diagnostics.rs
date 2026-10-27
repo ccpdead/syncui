@@ -34,6 +34,15 @@ impl Diagnostics {
         directory: Option<&Path>,
         emit: impl Fn(&str) + Send + Sync + 'static,
     ) -> Self {
+        Self::new_for_version(kind, directory, env!("CARGO_PKG_VERSION"), emit)
+    }
+
+    pub fn new_for_version(
+        kind: &str,
+        directory: Option<&Path>,
+        version: &str,
+        emit: impl Fn(&str) + Send + Sync + 'static,
+    ) -> Self {
         let timestamp = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .unwrap_or_default()
@@ -60,7 +69,7 @@ impl Diagnostics {
         }));
         this.log(format!(
             "任务开始：版本={}，系统={}/{}，构建={}",
-            env!("CARGO_PKG_VERSION"),
+            version,
             std::env::consts::OS,
             std::env::consts::ARCH,
             if cfg!(debug_assertions) {

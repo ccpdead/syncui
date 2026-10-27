@@ -7,3 +7,5 @@ src-tauri/target/
 crates/*/target/
 src-tauri/resources/agents/*/
 src-tauri/resources/syncui-bridge
+
+src-tauri/resources/syncui-bridge.gz

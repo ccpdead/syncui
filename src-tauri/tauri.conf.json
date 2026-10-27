@@ -1,6 +1,6 @@
 {
   "productName": "SyncUI",
-  "version": "0.2.0",
+  "version": "0.2.3",
   "identifier": "com.syncui.app",
   "mainBinaryName": "syncui",
   "build": {
@@ -34,9 +34,9 @@
       "icons/icon.png"
     ],
     "resources": [
-      "resources/syncui-bridge",
-      "resources/agents/x86_64/syncui-agent",
-      "resources/agents/aarch64/syncui-agent"
+      "resources/syncui-bridge.gz",
+      "resources/agents/x86_64/syncui-agent.gz",
+      "resources/agents/aarch64/syncui-agent.gz"
     ]
   }
 }

@@ -113,6 +113,7 @@ export default function App() {
   const [sshEndpoint, setSshEndpoint] = useState<Extract<RemoteEndpoint,{kind:"ssh"}>>({kind:"ssh",profileId:"",path:""});
   const [remoteKind, setRemoteKind] = useState<"filesystem"|"ssh">("filesystem");
   const [sshReady, setSshReady] = useState(false);
+  const [sshAuthReady, setSshAuthReady] = useState(false);
   const remoteEndpoint = useMemo<RemoteEndpoint>(() => remoteKind === "ssh" ? sshEndpoint : {kind:"filesystem",path:remotePath}, [remoteKind, sshEndpoint, remotePath]);
   const effectiveRemotePath = remoteEndpoint.path;
   const [mode, setMode] = useState<SyncMode>("mirror");
@@ -615,7 +616,7 @@ export default function App() {
         </div>
       </header>
 
-      <SshAuthDialog />
+      <SshAuthDialog onReady={setSshAuthReady} />
       <div className="endpoint-switch"><label>远端连接方式 <select disabled={comparing||syncing} value={remoteKind} onChange={e=>{setRemoteKind(e.target.value as "filesystem"|"ssh");setSshReady(false);}}><option value="filesystem">本地 / 挂载目录</option><option value="ssh">SSH 服务器</option></select></label>{remoteKind==="ssh"&&<span>远端直接扫描 · rsync 批量传输</span>}</div>
       <section className="zones">
         <DropZone
@@ -629,7 +630,7 @@ export default function App() {
           onClear={() => setLocalPath("")}
         />
         <div className="arrow">{arrowGlyph}</div>
-        {remoteKind === "ssh" ? <SshConnection endpoint={sshEndpoint} onChange={setSshEndpoint} onReady={setSshReady} disabled={comparing||syncing}/> : <DropZone
+        {remoteKind === "ssh" ? <SshConnection authReady={sshAuthReady} endpoint={sshEndpoint} onChange={setSshEndpoint} onReady={setSshReady} disabled={comparing||syncing}/> : <DropZone
           ref={remoteRef}
           disabled={comparing || syncing}
           title="远程 / 挂载目录"

@@ -2,7 +2,7 @@
 use std::{
     io::{self, BufRead, Read, Write},
     os::unix::net::UnixStream,
-    process::{Command, Stdio},
+    process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         Arc,
@@ -26,8 +26,8 @@ fn main() {
     }
 }
 fn run() -> Result<(), Box<dyn std::error::Error>> {
-    let config: BridgeConfig =
-        serde_json::from_slice(&std::fs::read(std::env::var("SYNCUI_BRIDGE_CONFIG")?)?)?;
+    let config_path = std::path::PathBuf::from(std::env::var("SYNCUI_BRIDGE_CONFIG")?);
+    let config: BridgeConfig = serde_json::from_slice(&std::fs::read(&config_path)?)?;
     let args: Vec<String> = std::env::args().skip(1).collect();
     if args.first().map(String::as_str) != Some("rsync-rsh") {
         let s = send(
@@ -57,14 +57,17 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         .map(|s| quote(s))
         .collect::<Vec<_>>()
         .join(" ");
-    let mut child = Command::new("ssh")
-        .args(&config.ssh_args)
-        .arg(&config.host)
-        .arg(remote)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::inherit())
-        .spawn()?;
+    let mut child = sync_core::bridge::multiplex_command(
+        &config.host,
+        &config.ssh_args,
+        &std::env::current_exe()?,
+        &config_path,
+    )
+    .arg(remote)
+    .stdin(Stdio::piped())
+    .stdout(Stdio::piped())
+    .stderr(Stdio::inherit())
+    .spawn()?;
     let count = Arc::new(AtomicU64::new(0));
     let stop = Arc::new(AtomicBool::new(false));
     let n = count.clone();

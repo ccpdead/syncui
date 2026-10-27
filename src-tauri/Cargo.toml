@@ -5,7 +5,7 @@
 # GUI (universe/sync-ui), and unattended-upgrades would replace our 0.1.0
 # with their 2.0.0-3 overnight.
 name = "syncui"
-version = "0.2.0"
+version = "0.2.3"
 description = "Cross-platform directory sync GUI"
 authors = ["you"]
 edition = "2021"
@@ -21,6 +21,7 @@ tauri-build = { version = "2", features = [] }
 sync-core = { path = "../crates/sync-core" }
 libc = "0.2"
 sha2 = "0.10"
+flate2 = "1"
 tauri = { version = "2", features = [] }
 tauri-plugin-dialog = "2"
 serde = { version = "1", features = ["derive"] }

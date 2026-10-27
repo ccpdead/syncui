@@ -91,16 +91,17 @@ fn validate(p: &SshProfile) -> Result<(), String> {
     }
     Ok(())
 }
-pub fn resource(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+fn resource(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
+    let archive = format!("{name}.gz");
     let dev = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
         .join("resources")
-        .join(name);
+        .join(&archive);
     let packaged = app
         .path()
         .resource_dir()
         .map_err(|e| e.to_string())?
         .join("resources")
-        .join(name);
+        .join(&archive);
     if packaged.is_file() {
         Ok(packaged)
     } else if cfg!(debug_assertions) && dev.is_file() {
@@ -111,6 +112,20 @@ pub fn resource(app: &AppHandle, name: &str) -> Result<PathBuf, String> {
         ))
     }
 }
+fn resource_bytes(app: &AppHandle, name: &str) -> Result<Vec<u8>, String> {
+    let path = resource(app, name)?;
+    let archive = fs::File::open(path).map_err(|e| format!("无法读取 {name}: {e}"))?;
+    let mut bytes = Vec::new();
+    flate2::read::GzDecoder::new(archive)
+        .take(32 * 1024 * 1024 + 1)
+        .read_to_end(&mut bytes)
+        .map_err(|e| format!("无法解压 {name}: {e}"))?;
+    if bytes.len() > 32 * 1024 * 1024 || !bytes.starts_with(b"\x7fELF") {
+        return Err(format!("安装包中的 {name} 无效，请重新安装"));
+    }
+    Ok(bytes)
+}
+
 pub struct Connection {
     pub profile: SshProfile,
     pub info: Mutex<ConnectionInfo>,
@@ -127,10 +142,31 @@ impl Drop for Connection {
     fn drop(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Ok(c) = self.master.get_mut() {
-            kill(c);
+            if c.try_wait().ok().flatten().is_none() {
+                kill(c);
+            }
             let _ = c.wait();
         }
         let _ = fs::remove_dir_all(&self.directory);
+    }
+}
+pub const DISCONNECTED: &str = "SSH 主连接已断开，请重新连接服务器并重新对比后再同步";
+
+/// Observe a stop without consuming the child's exit status used by Child.
+fn stopped_signal(child: &Child) -> Option<i32> {
+    let mut info = std::mem::MaybeUninit::<libc::siginfo_t>::zeroed();
+    unsafe {
+        if libc::waitid(
+            libc::P_PID,
+            child.id(),
+            info.as_mut_ptr(),
+            libc::WSTOPPED | libc::WNOHANG | libc::WNOWAIT,
+        ) != 0
+        {
+            return None;
+        }
+        let info = info.assume_init();
+        (info.si_pid() != 0 && info.si_code == libc::CLD_STOPPED).then(|| info.si_status())
     }
 }
 pub fn kill(c: &mut Child) {
@@ -211,11 +247,19 @@ pub fn process_live(
         String::from_utf8_lossy(&tail).into_owned()
     });
     let mut cancelled = false;
+    let mut failure = None;
     let status = loop {
         for chunk in output_rx.try_iter() {
             output(&chunk);
         }
-        if cancel.load(Ordering::Relaxed) || overflow.load(Ordering::Relaxed) {
+        if let Some(signal) = stopped_signal(&child) {
+            failure = Some(format!(
+                "同步子进程被系统暂停（信号 {signal}），任务已停止，请重新连接并重新对比"
+            ));
+        } else if overflow.load(Ordering::Relaxed) {
+            failure = Some("远端输出超过限制".into());
+        }
+        if failure.is_some() || cancel.load(Ordering::Relaxed) {
             cancelled = true;
             kill(&mut child);
             break child.wait().map_err(|e| e.to_string())?;
@@ -240,6 +284,9 @@ pub fn process_live(
         output(&chunk);
     }
     let stderr = errors.join().unwrap_or_default();
+    if let Some(error) = failure {
+        return Err(error);
+    }
     if cancelled {
         return Err(crate::engine::CANCELLED.into());
     }
@@ -253,16 +300,35 @@ pub fn process_live(
         success: status.success(),
     })
 }
+/// System SSH/rsync must not load GTK/AppImage's bundled shared libraries.
+pub fn system_command(program: &str) -> Command {
+    let mut cmd = Command::new(program);
+    if std::env::var_os("APPIMAGE").is_some() || std::env::var_os("APPDIR").is_some() {
+        cmd.env_remove("LD_LIBRARY_PATH").env_remove("LD_PRELOAD");
+    }
+    cmd
+}
 impl Connection {
+    pub fn ensure_alive(&self) -> Result<(), String> {
+        let mut master = self.master.lock().map_err(|_| DISCONNECTED)?;
+        if self.stop.load(Ordering::Relaxed)
+            || master.try_wait().map_err(|e| e.to_string())?.is_some()
+            || !self.control.exists()
+            || stopped_signal(&master).is_some()
+        {
+            self.stop.store(true, Ordering::Relaxed);
+            return Err(DISCONNECTED.into());
+        }
+        Ok(())
+    }
     pub fn command(&self, remote: &str) -> Command {
-        let mut c = Command::new("ssh");
-        c.args(["-o", "ControlMaster=no"])
-            .args(&self.ssh_args)
-            .arg(&self.profile.host)
-            .arg(remote)
-            .env("SYNCUI_BRIDGE_CONFIG", &self.config)
-            .env("SSH_ASKPASS", &self.bridge)
-            .env("SSH_ASKPASS_REQUIRE", "force");
+        let mut c = sync_core::bridge::multiplex_command(
+            &self.profile.host,
+            &self.ssh_args,
+            &self.bridge,
+            &self.config,
+        );
+        c.arg(remote);
         c
     }
     pub fn exec(
@@ -271,8 +337,10 @@ impl Connection {
         input: Vec<u8>,
         cancel: &AtomicBool,
     ) -> Result<Vec<u8>, String> {
+        self.ensure_alive()?;
         let out = process(self.command(remote), input, cancel, &mut || {})?;
         if !out.success {
+            self.ensure_alive()?;
             Err(format!("SSH 命令失败: {}", out.stderr.trim()))
         } else {
             Ok(out.stdout)
@@ -291,6 +359,7 @@ impl Connection {
         cancel: &AtomicBool,
         entries: &mut dyn FnMut(Vec<(String, Stamp)>),
     ) -> Result<Value, String> {
+        self.ensure_alive()?;
         let id = random_id();
         let request = Request {
             version: protocol::VERSION,
@@ -364,6 +433,16 @@ impl Connection {
                 result = Err(crate::engine::CANCELLED.into());
                 break;
             }
+            if let Err(error) = self.ensure_alive() {
+                result = Err(error);
+                break;
+            }
+            if let Some(signal) = stopped_signal(&child) {
+                result = Err(format!(
+                    "SSH 子进程被系统暂停（信号 {signal}），请重新连接并重新对比"
+                ));
+                break;
+            }
             match rx.recv_timeout(Duration::from_millis(100)) {
                 Ok(Ok(f)) if f.id == id && f.version == protocol::VERSION => match f.event.as_str()
                 {
@@ -424,6 +503,9 @@ impl Connection {
         let _ = writer.join();
         let _ = reader.join();
         let errors = error_reader.join().unwrap_or_default();
+        if result.is_err() && !errors.trim().is_empty() {
+            return Err(format!("{}: {}", result.unwrap_err(), errors.trim()));
+        }
         if result.is_ok() && !status.map(|s| s.success()).unwrap_or(false) {
             return Err(format!("Agent 异常退出: {}", errors.trim()));
         }
@@ -443,29 +525,38 @@ pub fn connect(
         .app_config_dir()
         .ok()
         .map(|p| p.join("diagnostics"));
-    let log = crate::diagnostics::Diagnostics::new("ssh-connect", dir.as_deref(), move |s| {
-        let _ = handle.emit("diagnostic-log", s);
-    });
+    let log = crate::diagnostics::Diagnostics::new_for_version(
+        "ssh-connect",
+        dir.as_deref(),
+        env!("CARGO_PKG_VERSION"),
+        move |s| {
+            let _ = handle.emit("diagnostic-log", s);
+        },
+    );
+    log.log(format!("SSH 客户端版本={}", env!("CARGO_PKG_VERSION")));
     let started = Instant::now();
-    if let Some(old) = state.connections.lock().unwrap().get(&profile.id).cloned() {
-        if old.profile == profile
-            && old
-                .master
-                .lock()
-                .unwrap()
-                .try_wait()
-                .map_err(|e| e.to_string())?
-                .is_none()
-        {
+    let old = state.connections.lock().unwrap().get(&profile.id).cloned();
+    if let Some(old) = old {
+        if old.profile == profile && old.ensure_alive().is_ok() {
             log.log("复用已有 SSH ControlMaster 连接");
             return Ok(old);
         }
     }
-    let bridge = resource(app, "syncui-bridge")?;
+    state.connections.lock().unwrap().remove(&profile.id);
+    let bundled_bridge = resource_bytes(app, "syncui-bridge")?;
     let directory = std::env::temp_dir().join(format!("syncui-{}", random_id()));
     fs::create_dir(&directory).map_err(|e| e.to_string())?;
     fs::set_permissions(&directory, fs::Permissions::from_mode(0o700))
         .map_err(|e| e.to_string())?;
+    // Execute askpass from our private runtime, independently of the AppImage mount.
+    let bridge = directory.join("syncui-bridge");
+    if let Err(e) = fs::write(&bridge, &bundled_bridge)
+        .and_then(|_| fs::set_permissions(&bridge, fs::Permissions::from_mode(0o700)))
+    {
+        let _ = fs::remove_dir_all(&directory);
+        return Err(format!("无法准备 SSH 身份验证辅助程序: {e}"));
+    }
+    log.log(format!("身份验证辅助程序已准备：{}", bridge.display()));
     let control = directory.join("master");
     let socket = directory.join("bridge.sock");
     let config = directory.join("bridge.json");
@@ -486,6 +577,8 @@ pub fn connect(
         "ServerAliveInterval=15".into(),
         "-o".into(),
         "ServerAliveCountMax=3".into(),
+        "-o".into(),
+        "BatchMode=no".into(),
         "-o".into(),
         "StrictHostKeyChecking=ask".into(),
         "-o".into(),
@@ -543,6 +636,9 @@ pub fn connect(
     let secret_auth = secret.clone();
     let last_auth = last_password.clone();
     let connection_id = profile.id.clone();
+    let auth_log = log.clone();
+    let auth_requests = Arc::new(AtomicU64::new(0));
+    let auth_count = auth_requests.clone();
     std::thread::spawn(move || {
         while !stop_auth.load(Ordering::Relaxed) {
             match listener.accept() {
@@ -562,6 +658,13 @@ pub fn connect(
                             let _ = stream.write_all(b"ok\n");
                         }
                         Ok(Message::Auth { token: t, prompt }) if t == token => {
+                            auth_count.fetch_add(1, Ordering::Relaxed);
+                            let is_host_key = prompt.contains("yes/no");
+                            auth_log.log(if is_host_key {
+                                "收到主机指纹确认请求"
+                            } else {
+                                "收到 SSH 身份验证请求"
+                            });
                             let is_password = prompt.to_lowercase().contains("password:");
                             let supplied = if is_password {
                                 secret_auth.lock().unwrap().take()
@@ -574,7 +677,12 @@ pub fn connect(
                                 let id = random_id();
                                 let (tx, rx) = mpsc::channel();
                                 pending.lock().unwrap().insert(id.clone(), tx);
-                                let _=app_auth.emit("ssh-auth-request",json!({"id":id,"connectionId":connection_id,"prompt":prompt,"kind":if prompt.contains("yes/no"){"hostKey"}else{"secret"}}));
+                                if let Err(e) = app_auth.emit("ssh-auth-request",json!({"id":id,"connectionId":connection_id,"prompt":prompt,"kind":if is_host_key {"hostKey"}else{"secret"}})) {
+                                    auth_log.log(format!("无法发送身份验证弹窗事件: {e}"));
+                                    pending.lock().unwrap().remove(&id);
+                                } else {
+                                    auth_log.log("身份验证弹窗事件已发送，等待用户确认");
+                                }
                                 let deadline = Instant::now() + Duration::from_secs(180);
                                 let reply = loop {
                                     if stop_auth.load(Ordering::Relaxed)
@@ -589,6 +697,11 @@ pub fn connect(
                                     }
                                 };
                                 pending.lock().unwrap().remove(&id);
+                                auth_log.log(if reply.is_some() {
+                                    "身份验证弹窗已回复"
+                                } else {
+                                    "身份验证弹窗取消或超时"
+                                });
                                 reply
                             };
                             if is_password {
@@ -609,7 +722,7 @@ pub fn connect(
     });
     let logpath = directory.join("master.log");
     let master_log = fs::File::create(&logpath).map_err(|e| e.to_string())?;
-    let mut command = Command::new("ssh");
+    let mut command = system_command("ssh");
     command
         .args(["-v", "-M", "-N"])
         .args(&args)
@@ -663,6 +776,11 @@ pub fn connect(
             .is_some()
         {
             let raw = fs::read_to_string(&logpath).unwrap_or_default();
+            log.detail(&raw);
+            log.log(format!(
+                "SSH 连接失败；收到的身份验证请求数={}",
+                auth_requests.load(Ordering::Relaxed)
+            ));
             return Err(format!(
                 "SSH 连接失败: {}",
                 raw.lines()
@@ -735,6 +853,47 @@ pub fn connect(
         .lock()
         .unwrap()
         .insert(profile.id.clone(), conn.clone());
+    // Passive monitoring only: do not send requests or reconnect in the background.
+    let connection = Arc::downgrade(&conn);
+    let monitor_app = app.clone();
+    let monitor_log = log.clone();
+    std::thread::spawn(move || loop {
+        std::thread::sleep(Duration::from_millis(500));
+        let Some(c) = connection.upgrade() else {
+            break;
+        };
+        if let Err(reason) = c.ensure_alive() {
+            let state = monitor_app.state::<SshState>();
+            let removed = {
+                let mut connections = state.connections.lock().unwrap();
+                if connections
+                    .get(&c.profile.id)
+                    .is_some_and(|current| Arc::ptr_eq(current, &c))
+                {
+                    connections.remove(&c.profile.id);
+                    true
+                } else {
+                    false
+                }
+            };
+            if removed {
+                monitor_app
+                    .state::<crate::coordinator::Coordinator>()
+                    .sessions
+                    .lock()
+                    .unwrap()
+                    .clear();
+                monitor_log.log(&reason);
+                let _ = monitor_app.emit(
+                    "ssh-connection-state",
+                    json!({
+                        "connectionId": c.profile.id, "connected": false, "reason": reason,
+                    }),
+                );
+            }
+            break;
+        }
+    });
     Ok(conn)
 }
 pub fn rsync_version_ok(text: &str) -> bool {
@@ -755,8 +914,7 @@ pub fn deploy(app: &AppHandle, c: &Connection) -> Result<ConnectionInfo, String>
         "aarch64" | "arm64" => "aarch64",
         _ => return Err(format!("不支持的远端架构: {arch}")),
     };
-    let binary = resource(app, &format!("agents/{target}/syncui-agent"))?;
-    let bytes = fs::read(&binary).map_err(|e| e.to_string())?;
+    let bytes = resource_bytes(app, &format!("agents/{target}/syncui-agent"))?;
     let hash = format!("{:x}", Sha256::digest(&bytes));
     let home = c.info.lock().unwrap().home.clone();
     let base = format!("{home}/.local/share/syncui/agent");

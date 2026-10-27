@@ -11,7 +11,6 @@ use serde::{Deserialize, Serialize};
 use std::{
     collections::{BTreeMap, BTreeSet},
     path::{Path, PathBuf},
-    process::Command,
     sync::{
         atomic::{AtomicBool, Ordering},
         Arc, Mutex,
@@ -61,6 +60,7 @@ fn endpoint(app: &AppHandle, remote: &RemoteEndpoint) -> Result<Box<dyn Endpoint
                 .get(profile_id)
                 .cloned()
                 .ok_or("SSH 尚未连接，请先连接服务器")?;
+            c.ensure_alive()?;
             if !c.info.lock().unwrap().agent_ready {
                 return Err("请先部署远端工具".into());
             }
@@ -78,7 +78,7 @@ fn diagnostics(app: &AppHandle, kind: &str) -> Diagnostics {
         .ok()
         .map(|p| p.join("diagnostics"));
     let a = app.clone();
-    Diagnostics::new(kind, dir.as_deref(), move |s| {
+    Diagnostics::new_for_version(kind, dir.as_deref(), env!("CARGO_PKG_VERSION"), move |s| {
         let _ = a.emit("diagnostic-log", s);
     })
 }
@@ -428,7 +428,8 @@ fn rsync_batch(
     base_logical: u64,
     start: Instant,
 ) -> Result<u64, String> {
-    let probe = Command::new("rsync")
+    c.ensure_alive()?;
+    let probe = ssh::system_command("rsync")
         .arg("--version")
         .output()
         .map_err(|_| "本机缺少 rsync，请安装 rsync >= 3.2.0")?;
@@ -447,7 +448,7 @@ fn rsync_batch(
     }
     let source = format!("{}/", local.trim_end_matches('/'));
     let destination = format!("syncui-peer:{}/", remote.trim_end_matches('/'));
-    let mut cmd = Command::new("rsync");
+    let mut cmd = ssh::system_command("rsync");
     cmd.args([
         "--times",
         "--perms",
@@ -592,7 +593,13 @@ fn sync_impl(
     ));
     let ops = selected_plan(&s, &paths, &policy)?;
     let all_paths: Vec<_> = ops.iter().map(|o| o.rel_path.clone()).collect();
+    let validation_started = Instant::now();
+    log.log(format!("同步前批量复核开始：files={}", all_paths.len()));
     let (mut before_l, mut before_r) = stats_pair(&l, r.as_ref(), &all_paths, cancel)?;
+    log.log(format!(
+        "同步前批量复核完成：elapsed={:.2}ms",
+        validation_started.elapsed().as_secs_f64() * 1000.
+    ));
     let mut result = SyncResult::default();
     let mut ready = vec![];
     let mut attempted = BTreeSet::new();

@@ -3,13 +3,26 @@ import { useEffect, useState } from "react";
 import { listen } from "@tauri-apps/api/event";
 import { SshProfile, ConnectionInfo, RemoteDirectory, RemoteEndpoint, loadSshProfiles, saveSshProfiles, connectSsh, deploySshAgent, disconnectSsh, forgetSshPassword, browseSsh, sshAuthReply } from "./api";
 const fresh = (): SshProfile => ({ id: crypto.randomUUID(), name: "新服务器", host: "", user: "", port: null, identityFile: "", auth: "auto", rememberPassword: false });
-export function SshAuthDialog() {
+export function SshAuthDialog({onReady}:{onReady:(ready:boolean)=>void}) {
   const [request, setRequest] = useState<{id:string;prompt:string;kind:string} | null>(null);
   const [answer,setAnswer]=useState("");
   const [error,setError]=useState("");
-  useEffect(()=>{if(!isTauri())return;const off=listen<{id:string;prompt:string;kind:string}>("ssh-auth-request",e=>{setRequest(e.payload);setAnswer("");setError("");});return()=>{void off.then(f=>f());};},[]);
-  if(!request)return null;
-  const reply=async(value:string|null)=>{try{await sshAuthReply(request.id,value);setRequest(null);setAnswer("");}catch(e){setError(String(e));setRequest(null);}};
+  useEffect(()=>{
+    if(!isTauri())return;
+    let disposed=false;
+    let unlisten:(()=>void)|undefined;
+    onReady(false);
+    void listen<{id:string;prompt:string;kind:string}>("ssh-auth-request",e=>{
+      if(disposed)return;
+      setRequest(e.payload);setAnswer("");setError("");
+    }).then(off=>{
+      if(disposed){off();return;}
+      unlisten=off;onReady(true);
+    }).catch(e=>{if(!disposed)setError(`无法初始化 SSH 身份确认弹窗：${String(e)}`);});
+    return()=>{disposed=true;unlisten?.();onReady(false);};
+  },[onReady]);
+  if(!request)return error?<p className="ssh-message" role="alert">{error}</p>:null;
+  const reply=async(value:string|null)=>{const id=request.id;try{await sshAuthReply(id,value);setRequest(current=>current?.id===id?null:current);setAnswer("");}catch(e){setError(String(e));setRequest(current=>current?.id===id?null:current);}};
   return <div className="ssh-modal-backdrop"><section className="ssh-modal" role="dialog" aria-modal="true" aria-labelledby="ssh-auth-title">
     <h3 id="ssh-auth-title">{request.kind==="hostKey"?"确认服务器身份":"SSH 身份验证"}</h3>
     <pre className="ssh-prompt">{request.prompt}</pre>
@@ -18,16 +31,26 @@ export function SshAuthDialog() {
     <div className="ssh-actions"><button className="btn" onClick={()=>void reply(null)}>取消</button><button className="btn primary" onClick={()=>void reply(request.kind==="hostKey"?"yes":answer)}>{request.kind==="hostKey"?"信任并继续":"继续"}</button></div>
   </section></div>;
 }
-export default function SshConnection({endpoint,onChange,onReady,disabled}:{endpoint:Extract<RemoteEndpoint,{kind:"ssh"}>;onChange:(e:Extract<RemoteEndpoint,{kind:"ssh"}>)=>void;onReady:(ready:boolean)=>void;disabled:boolean}) {
+export default function SshConnection({endpoint,onChange,onReady,disabled,authReady}:{endpoint:Extract<RemoteEndpoint,{kind:"ssh"}>;onChange:(e:Extract<RemoteEndpoint,{kind:"ssh"}>)=>void;onReady:(ready:boolean)=>void;disabled:boolean;authReady:boolean}) {
   const [expanded,setExpanded]=useState(true);
   const [profiles,setProfiles]=useState<SshProfile[]>([]);const [profile,setProfile]=useState<SshProfile>(fresh);
   const [password,setPassword]=useState("");const [info,setInfo]=useState<ConnectionInfo|null>(null);const [busy,setBusy]=useState(false);const [message,setMessage]=useState("");const [directory,setDirectory]=useState<RemoteDirectory|null>(null);
+  useEffect(()=>{
+    if(!isTauri())return;
+    let disposed=false;let unlisten:(()=>void)|undefined;
+    void listen<{connectionId:string;connected:boolean;reason:string}>("ssh-connection-state",e=>{
+      if(disposed||e.payload.connectionId!==profile.id||e.payload.connected)return;
+      setInfo(null);setDirectory(null);setExpanded(true);setMessage(e.payload.reason);onReady(false);
+    }).then(off=>{if(disposed)off();else unlisten=off;}).catch(e=>{if(!disposed)setMessage(`连接状态监听失败：${String(e)}`);});
+    return()=>{disposed=true;unlisten?.();};
+  },[profile.id,onReady]);
   useEffect(()=>{if(!isTauri()){setMessage("网页仅预览界面；连接、部署和同步请使用桌面应用。");return;}let dead=false;void loadSshProfiles().then(list=>{if(dead)return;setProfiles(list);const p=list.find(x=>x.id===endpoint.profileId)??list[0]??fresh();setProfile(p);onChange({...endpoint,profileId:p.id});}).catch(e=>setMessage(String(e)));return()=>{dead=true;};},[]);
   const change=(next:SshProfile)=>{setProfile(next);setInfo(null);onReady(false);};
   const run=async(action:()=>Promise<void>)=>{setBusy(true);setMessage("");try{await action();}catch(e){setMessage(String(e));}finally{setBusy(false);}};
   const remember=async()=>{const next=[...profiles.filter(p=>p.id!==profile.id),profile];await saveSshProfiles(next);setProfiles(next);};
   const connect=async()=>{await remember();const c=await connectSsh(profile,password||undefined);setPassword("");setInfo(c);setExpanded(!c.agentReady);setMessage(c.message);onReady(c.agentReady);if(!endpoint.path)onChange({...endpoint,path:c.home});return c;};
   const locked=disabled||busy;
+  const authUnavailable=isTauri()&&!authReady;
   return <section className="ssh-panel">
     <div className="ssh-heading"><strong>SSH 服务器</strong><button className="link" onClick={()=>setExpanded(!expanded)}>{expanded?"收起配置":"展开配置"}</button><span>{info?`${info.arch} · ${info.agentReady?"工具就绪":"待部署工具"}`:"未连接"}</span></div>
     {expanded&&<fieldset disabled={locked} className="ssh-fields">
@@ -44,8 +67,8 @@ export default function SshConnection({endpoint,onChange,onReady,disabled}:{endp
     </fieldset>}
     {!expanded&&<div className="ssh-summary">{profile.user?`${profile.user}@`:""}{profile.host||"未填写服务器"}<br/>{endpoint.path||"未选择目录"}</div>}
     <div className="ssh-actions">
-      <button className="btn primary" disabled={locked||!profile.host} onClick={()=>void run(async()=>{await connect();})}>{busy?"处理中…":"连接并检测"}</button>
-      <button className="btn" disabled={locked||!profile.host} onClick={()=>void run(async()=>{const c=info??await connect();const ready=await deploySshAgent(c.id);setInfo(ready);setExpanded(false);onReady(ready.agentReady);setMessage("远端工具已部署。"+ready.message);})}>部署 / 升级工具</button>
+      <button className="btn primary" disabled={locked||!profile.host||authUnavailable} onClick={()=>void run(async()=>{await connect();})}>{busy?"处理中…":authUnavailable?"正在准备身份确认…":"连接并检测"}</button>
+      <button className="btn" disabled={locked||!profile.host||authUnavailable} onClick={()=>void run(async()=>{const c=info??await connect();const ready=await deploySshAgent(c.id);setInfo(ready);setExpanded(false);onReady(ready.agentReady);setMessage("远端工具已部署。"+ready.message);})}>部署 / 升级工具</button>
       <button className="btn" disabled={locked||!info?.agentReady} onClick={()=>void run(async()=>setDirectory(await browseSsh(profile.id,endpoint.path)))}>浏览目录</button>
       <button className="btn" disabled={locked||!info} onClick={()=>void run(async()=>{await disconnectSsh(profile.id);setInfo(null);onReady(false);})}>断开</button>
       <button className="btn" disabled={locked} onClick={()=>void run(async()=>{await forgetSshPassword(profile);setMessage("已删除密钥环中的密码");})}>删除保存的密码</button>

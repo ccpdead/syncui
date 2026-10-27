@@ -2935,10 +2935,11 @@ dependencies = [
 
 [[package]]
 name = "syncui"
-version = "0.2.0"
+version = "0.2.3"
 dependencies = [
  "blake3",
  "filetime",
+ "flate2",
  "libc",
  "serde",
  "serde_json",
