@@ -66,6 +66,16 @@ export interface SyncProgress {
   ok: boolean;
   skipped: boolean;
   error: string | null;
+  elapsedMs: number;
+  bytesCopied: number;
+}
+
+/** Aggregate file-copy throughput, sampled about twice per second. */
+export interface TransferProgress {
+  bytesCopied: number;
+  bytesPerSecond: number;
+  elapsedSeconds: number;
+  finished: boolean;
 }
 
 export interface SyncResult {
@@ -80,6 +90,8 @@ export interface SyncResult {
   cancelled: boolean;
   /** Paths synced successfully; only filled when `cancelled` is true. */
   donePaths: string[];
+  bytesCopied: number;
+  elapsedSeconds: number;
 }
 
 /** Error message the backend returns for a cancelled compare. */

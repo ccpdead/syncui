@@ -13,6 +13,7 @@ import {
   CompareResult,
   DiffEntry,
   SyncProgress,
+  TransferProgress,
   Action,
   Op,
   SyncMode,
@@ -20,8 +21,16 @@ import {
 } from "./api";
 import DiffDrawer from "./DiffDrawer";
 import SelectionTree from "./SelectionTree";
+import IgnoreRules from "./IgnoreRules";
 
 const DIFFABLE: ReadonlySet<Action> = new Set(["upload", "download", "conflict"]);
+
+function formatTransferAmount(bytes: number): string {
+  const amount = Number.isFinite(bytes) ? Math.max(0, bytes) : 0;
+  return amount >= 1024 * 1024
+    ? `${(amount / (1024 * 1024)).toFixed(2)} MB`
+    : `${(amount / 1024).toFixed(1)} KB`;
+}
 
 /** Rebuild the per-action counts; `sameCount` is carried over because
  * identical files are not part of `entries`. */
@@ -115,6 +124,7 @@ export default function App() {
   /** A cancel request was sent for the running compare / sync. */
   const [cancelling, setCancelling] = useState(false);
   const [progress, setProgress] = useState<SyncProgress | null>(null);
+  const [transfer, setTransfer] = useState<TransferProgress | null>(null);
   const [log, setLog] = useState<string[]>([]);
   const [error, setError] = useState<string | null>(null);
   const [dragOver, setDragOver] = useState<Side | null>(null);
@@ -132,7 +142,9 @@ export default function App() {
   const resultAtRef = useRef<number | null>(null);
 
   const pushLog = useCallback((line: string) => {
-    setLog((prev) => [...prev.slice(-300), line]);
+    const now = new Date();
+    const stamp = `${now.toLocaleTimeString("zh-CN", { hour12: false })}.${String(now.getMilliseconds()).padStart(3, "0")}`;
+    setLog((prev) => [...prev.slice(-300), `[${stamp}] ${line}`]);
   }, []);
 
   const ignoreList = useMemo(
@@ -161,7 +173,7 @@ export default function App() {
         if (typeof s.concurrency === "number" && s.concurrency >= 1) {
           setConcurrency(Math.max(1, Math.min(32, s.concurrency)));
         }
-        if (typeof s.ignoreText === "string" && s.ignoreText.length > 0) {
+        if (typeof s.ignoreText === "string") {
           setIgnoreText(s.ignoreText);
         }
         if (s.localPath) setLocalPath(s.localPath);
@@ -263,8 +275,21 @@ export default function App() {
   }, [sideAtPosition]);
 
   useEffect(() => {
+    let disposed = false;
     let unlistenSync: (() => void) | undefined;
     let unlistenScan: (() => void) | undefined;
+    let unlistenTransfer: (() => void) | undefined;
+    let unlistenDiagnostics: (() => void) | undefined;
+    listen<string>("diagnostic-log", (e) => pushLog(e.payload)).then((fn) => {
+      if (disposed) fn();
+      else unlistenDiagnostics = fn;
+    });
+    listen<TransferProgress>("sync-transfer-progress", (e) => {
+      setTransfer(e.payload);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlistenTransfer = fn;
+    });
     listen<SyncProgress>("sync-progress", (e) => {
       const p = e.payload;
       setProgress(p);
@@ -276,18 +301,30 @@ export default function App() {
           : "上传";
       const mark = p.skipped ? "⊘" : p.ok ? "✓" : "✗";
       const tail = p.skipped ? " — 已跳过(文件已变动)" : p.error ? ` — ${p.error}` : "";
-      pushLog(`${mark} [${p.index}/${p.total}] ${verb} ${p.relPath}${tail}`);
-    }).then((fn) => (unlistenSync = fn));
+      const timing = Number.isFinite(p.elapsedMs)
+        ? ` — ${p.elapsedMs.toFixed(2)}ms，复制 ${p.bytesCopied} B`
+        : "";
+      pushLog(`${mark} [${p.index}/${p.total}] ${verb} ${p.relPath}${timing}${tail}`);
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlistenSync = fn;
+    });
     listen<{ phase: string; count: number }>("scan-progress", (e) => {
       const { phase, count } = e.payload;
       // Local and remote are scanned concurrently; keep both counters.
       setScanProgress((prev) =>
         prev ? { ...prev, [phase === "remote" ? "remote" : "local"]: count } : prev
       );
-    }).then((fn) => (unlistenScan = fn));
+    }).then((fn) => {
+      if (disposed) fn();
+      else unlistenScan = fn;
+    });
     return () => {
+      disposed = true;
       if (unlistenSync) unlistenSync();
       if (unlistenScan) unlistenScan();
+      if (unlistenTransfer) unlistenTransfer();
+      if (unlistenDiagnostics) unlistenDiagnostics();
     };
   }, [pushLog]);
 
@@ -334,7 +371,7 @@ export default function App() {
     return () => cancelAnimationFrame(raf);
   }, [result, pushLog]);
 
-  const runCompare = async () => {
+  const runCompare = async (reason: "manual" | "after-sync" = "manual") => {
     setError(null);
     if (!localPath || !remotePath) {
       setError("请先指定本地目录和远程/挂载目录。");
@@ -347,12 +384,15 @@ export default function App() {
     setActionFilter("all");
     setDiffEntry(null);
     setScanProgress({ local: 0, remote: 0 });
+    const compareStarted = performance.now();
+    pushLog(`[诊断/前端] 开始${reason === "after-sync" ? "同步后自动" : "手动"}对比：mode=${mode} hash=${useHash}，忽略规则=${ignoreList.length}项`);
     try {
       const res = await compareDirs(localPath, remotePath, {
         useHash,
         ignore: ignoreList,
         mode,
       });
+      pushLog(`[诊断/前端] 对比命令往返：${(performance.now() - compareStarted).toFixed(2)}ms（含后台排队/扫描/哈希/结果传输）`);
       resultAtRef.current = performance.now();
       setResult(res);
       // Right pane only lists tree selection — start empty so user picks via the tree.
@@ -369,6 +409,7 @@ export default function App() {
       setComparing(false);
       setCancelling(false);
       setScanProgress(null);
+      pushLog(`[诊断/前端] ${reason === "after-sync" ? "同步后自动" : "手动"}对比结束：${(performance.now() - compareStarted).toFixed(2)}ms`);
     }
   };
 
@@ -469,11 +510,30 @@ export default function App() {
     setSyncing(true);
     setCancelling(false);
     setProgress(null);
+    setTransfer({ bytesCopied: 0, bytesPerSecond: 0, elapsedSeconds: 0, finished: false });
+    const syncStarted = performance.now();
+    const copyItems = items.filter((item) => item.op === "upload" || item.op === "download");
+    const plannedBytes = copyItems.reduce((sum, item) => {
+      const entry = changedByPath.get(item.relPath);
+      return sum + (item.op === "upload" ? entry?.localSize ?? 0 : entry?.remoteSize ?? 0);
+    }, 0);
+    pushLog(`开始同步：${items.length} 项，正在统计传输速度…`);
+    pushLog(`[诊断/前端] 任务预估：复制=${copyItems.length}项，预计=${plannedBytes} B，平均文件=${Math.round(plannedBytes / Math.max(1, copyItems.length))} B，workers=${concurrency}，hash=${useHash}`);
     try {
       const res = await syncEntries(localPath, remotePath, items, ignoreList, concurrency, mode);
+      const commandMs = performance.now() - syncStarted;
+      pushLog(`[诊断/前端] 同步命令往返=${commandMs.toFixed(2)}ms；文件操作=${(res.elapsedSeconds * 1000).toFixed(2)}ms；其余=${Math.max(0, commandMs - res.elapsedSeconds * 1000).toFixed(2)}ms（含快照/排队/通信/诊断等）`);
+      const averageSpeed = res.elapsedSeconds > 0 ? res.bytesCopied / res.elapsedSeconds : 0;
+      setTransfer({
+        bytesCopied: res.bytesCopied,
+        bytesPerSecond: averageSpeed,
+        elapsedSeconds: res.elapsedSeconds,
+        finished: true,
+      });
       const summary =
         `↑${res.uploaded} ↓${res.downloaded} 删远程${res.deletedRemote} ` +
-        `删本地${res.deletedLocal} 跳过${res.skipped} 失败${res.failed}`;
+        `删本地${res.deletedLocal} 跳过${res.skipped} 失败${res.failed}，` +
+        `已传输 ${formatTransferAmount(res.bytesCopied)}，平均速度 ${formatTransferAmount(averageSpeed)}/s`;
       if (res.cancelled) {
         // Skip the (possibly very slow) full re-compare: drop what was done.
         pushLog(`同步已取消（${res.donePaths.length}/${items.length} 项已完成）：${summary}`);
@@ -491,13 +551,21 @@ export default function App() {
         setDiffEntry((d) => (d && done.has(d.relPath) ? null : d));
       } else {
         pushLog(`同步结束：${summary}`);
-        await runCompare();
+        const recompareStarted = performance.now();
+        await runCompare("after-sync");
+        pushLog(`[诊断/前端] 同步后重新对比：${(performance.now() - recompareStarted).toFixed(2)}ms`);
       }
     } catch (e) {
       setError(String(e));
     } finally {
       setSyncing(false);
       setCancelling(false);
+      setTransfer((prev) => prev ? {
+        ...prev,
+        finished: true,
+        bytesPerSecond: prev.elapsedSeconds > 0 ? prev.bytesCopied / prev.elapsedSeconds : 0,
+      } : prev);
+      pushLog(`[诊断/前端] 同步流程整体耗时：${(performance.now() - syncStarted).toFixed(2)}ms（文件操作 + 快照重建/保存 + 自动重新对比）`);
     }
   };
 
@@ -603,22 +671,17 @@ export default function App() {
           <input type="checkbox" checked={useHash} onChange={(e) => setUseHash(e.target.checked)} />
           哈希校验
         </label>
-        <label className="opt ignore">
-          忽略
-          <input
-            type="text"
-            value={ignoreText}
-            onChange={(e) => setIgnoreText(e.target.value)}
-            placeholder=".git, node_modules"
-            title={
-              "逗号分隔，按名字整段匹配：\n" +
-              "build / **/build：任意层级名为 build 的目录\n" +
-              "*.bkp：通配符\n" +
-              "slam_ws/build：从根目录起的路径"
-            }
-          />
-        </label>
-        <button className="btn primary" onClick={runCompare} disabled={comparing || syncing}>
+        <IgnoreRules
+          value={ignoreList}
+          disabled={!settingsReady || comparing || syncing}
+          onChange={(rules) => {
+            setIgnoreText(rules.join(", "));
+            setResult(null);
+            setSelected(new Set());
+            setDiffEntry(null);
+          }}
+        />
+        <button className="btn primary" onClick={() => void runCompare()} disabled={comparing || syncing}>
           {comparing ? "对比中…" : "对比 Compare"}
         </button>
       </section>
@@ -793,8 +856,17 @@ export default function App() {
         </section>
       )}
 
-      {log.length > 0 && (
-        <section className="logbox">
+      {(log.length > 0 || syncing) && (
+        <section className="logbox" aria-label="同步日志">
+          {transfer && (
+            <div className="log-transfer-status">
+              <span>
+                {transfer.finished ? "平均同步速度" : "当前同步速度"}
+                <strong>{formatTransferAmount(transfer.bytesPerSecond)}/s</strong>
+              </span>
+              <span>已传输 {formatTransferAmount(transfer.bytesCopied)}</span>
+            </div>
+          )}
           {log.map((l, i) => (
             <div key={i} className="logline">
               {l}

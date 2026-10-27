@@ -127,13 +127,179 @@ body {
   gap: 6px;
   color: var(--muted);
 }
-.opt.ignore input {
-  width: 240px;
+.ignore-trigger {
+  display: inline-flex;
+  align-items: center;
+  gap: 10px;
+}
+.ignore-trigger .ignore-count {
+  font-size: 12px;
+}
+.ignore-dialog {
+  width: min(620px, calc(100vw - 32px));
+  max-height: calc(100vh - 40px);
+  padding: 0;
+  background: var(--panel);
+  color: var(--text);
+  border: 1px solid var(--border);
+  border-radius: 14px;
+  box-shadow: 0 24px 80px rgba(0, 0, 0, 0.45);
+  overflow: hidden;
+}
+.ignore-dialog::backdrop {
+  background: rgba(0, 0, 0, 0.6);
+}
+.ignore-dialog-form {
+  display: flex;
+  flex-direction: column;
+  max-height: calc(100vh - 42px);
+}
+.ignore-dialog-header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 22px 24px 18px;
+  border-bottom: 1px solid var(--border);
+}
+.ignore-dialog-header h2 {
+  margin: 0;
+  font-size: 18px;
+  font-weight: 600;
+}
+.ignore-dialog-header p {
+  margin: 8px 0 0;
+  color: var(--muted);
+  font-size: 12px;
+  line-height: 1.6;
+}
+.ignore-close {
+  flex-shrink: 0;
+  width: 28px;
+  height: 28px;
+  padding: 0;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--muted);
+  font-size: 22px;
+  cursor: pointer;
+}
+.ignore-close:hover {
+  color: var(--text);
+  border-color: var(--accent);
+}
+.ignore-dialog-body {
+  min-height: 0;
+  padding: 20px 24px;
+  overflow-y: auto;
+}
+.ignore-rules {
+  min-width: 0;
+  margin: 0;
+  padding: 0;
+  border: 0;
+}
+.ignore-rules legend {
+  padding: 0;
+  color: var(--text);
+  font-size: 13px;
+  font-weight: 600;
+}
+.ignore-count {
+  color: var(--muted);
+  font-size: 13px;
+}
+.ignore-selection-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: 10px;
+  margin: -18px 0 12px 100px;
+}
+.ignore-options {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(150px, 100%), 1fr));
+  gap: 9px;
+}
+.ignore-rule {
+  display: flex;
+  align-items: center;
+  gap: 7px;
+  min-width: 0;
+  max-width: 100%;
+  padding: 11px 12px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  background: var(--panel-2);
+  color: var(--muted);
+  cursor: pointer;
+  font-size: 12px;
+}
+.ignore-rule span {
+  overflow-wrap: anywhere;
+  font-family: ui-monospace, "Cascadia Code", monospace;
+}
+.ignore-rule.checked {
+  border-color: #34578a;
+  background: #19283f;
+  color: var(--text);
+}
+.ignore-rule:hover {
+  border-color: var(--accent);
+}
+.ignore-rule:focus-within {
+  outline: 2px solid var(--accent);
+  outline-offset: 2px;
+}
+.ignore-rule input {
+  flex-shrink: 0;
+  margin: 0;
+  accent-color: var(--accent);
+}
+.ignore-rules:disabled .ignore-rule {
+  opacity: 0.55;
+  cursor: not-allowed;
+}
+.ignore-custom {
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  margin-top: 22px;
+  color: var(--muted);
+  font-size: 12px;
+}
+.ignore-custom-entry {
+  display: flex;
+  gap: 8px;
+}
+.ignore-custom input {
+  flex: 1;
+  min-width: 0;
   background: var(--panel-2);
   border: 1px solid var(--border);
   color: var(--text);
   border-radius: 8px;
-  padding: 6px 8px;
+  padding: 8px 10px;
+}
+.ignore-custom input:focus {
+  outline: 2px solid var(--accent);
+  outline-offset: 1px;
+}
+.ignore-hint {
+  color: var(--muted);
+  line-height: 1.5;
+}
+.ignore-dialog-footer {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 10px;
+  padding: 16px 24px;
+  border-top: 1px solid var(--border);
+  background: var(--panel-2);
+}
+.ignore-dialog-footer .ignore-count {
+  flex: 1;
 }
 .opt select,
 .opt input[type="number"] {
@@ -635,6 +801,27 @@ body {
 .logline {
   white-space: pre-wrap;
   word-break: break-all;
+}
+.log-transfer-status {
+  position: sticky;
+  top: -8px;
+  z-index: 1;
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 8px 24px;
+  margin: -8px -12px 8px;
+  padding: 9px 12px;
+  border-bottom: 1px solid var(--border);
+  background: #111c2b;
+  color: var(--muted);
+  font-variant-numeric: tabular-nums;
+}
+.log-transfer-status strong {
+  margin-left: 10px;
+  color: #60a5fa;
+  font-size: 13px;
+  font-weight: 600;
 }
 
 .scanning {

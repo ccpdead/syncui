@@ -4,15 +4,16 @@
 //! local folder or a mounted remote (sftp/smb/nfs) folder — both look like
 //! plain paths to the OS.
 
+use crate::diagnostics::Diagnostics;
 use crate::snapshot::{SnapEntry, Snapshot};
 use serde::{Deserialize, Serialize};
 use std::collections::{BTreeMap, BTreeSet};
 use std::fs;
-use std::io::Read;
+use std::io::{Read, Write};
 use std::path::{Component, Path, PathBuf};
-use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{mpsc, Mutex};
-use std::time::{Instant, UNIX_EPOCH};
+use std::time::{Duration, Instant, UNIX_EPOCH};
 use walkdir::WalkDir;
 
 /// Error returned when a compare is aborted through its cancel flag.
@@ -199,10 +200,20 @@ fn scan(
     ignore: &[String],
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(usize),
+    diagnostics: &Diagnostics,
+    label: &str,
 ) -> Result<(BTreeMap<String, FileMeta>, usize), String> {
+    let started = Instant::now();
+    let mut metadata_ms = 0.0;
+    let mut scan_errors = 0usize;
+    let mut symlinks = 0usize;
+    let mut slow_metadata: Vec<(f64, String)> = Vec::new();
+    let mut last_update = Instant::now();
+    diagnostics.log(format!("扫描开始：phase={label} root={root:?}"));
     let mut map = BTreeMap::new();
     let mut skipped: usize = 0;
     if !root.exists() {
+        diagnostics.log(format!("扫描失败：phase={label} 路径不存在 root={root:?}"));
         return Err(format!("路径不存在: {}", root.display()));
     }
     let walker = WalkDir::new(root)
@@ -219,12 +230,24 @@ fn scan(
     let mut seen = 0usize;
     for entry in walker {
         if is_cancelled(cancel) {
+            diagnostics.log(format!(
+                "扫描取消：phase={label} files={} elapsed={:.2}ms",
+                map.len(),
+                started.elapsed().as_secs_f64() * 1000.0
+            ));
             return Err(CANCELLED.into());
         }
         let entry = match entry {
             Ok(e) => e,
-            Err(_) => {
+            Err(error) => {
                 skipped += 1;
+                scan_errors += 1;
+                let message = format!("扫描跳过：phase={label} error={error:?}");
+                if scan_errors <= 3 {
+                    diagnostics.log(message);
+                } else {
+                    diagnostics.detail(message);
+                }
                 continue;
             }
         };
@@ -232,6 +255,7 @@ fn scan(
         if ft.is_symlink() || !ft.is_file() {
             if ft.is_symlink() {
                 skipped += 1;
+                symlinks += 1;
             }
             continue;
         }
@@ -247,13 +271,32 @@ fn scan(
         if rel_str.ends_with(".synctmp") {
             continue;
         }
-        let meta = match entry.metadata() {
+        let previous_metadata_ms = metadata_ms;
+        let meta = match timed(&mut metadata_ms, || entry.metadata()) {
             Ok(m) => m,
-            Err(_) => {
+            Err(error) => {
                 skipped += 1;
+                scan_errors += 1;
+                let message =
+                    format!("metadata跳过：phase={label} path={rel_str:?} error={error:?}");
+                if scan_errors <= 3 {
+                    diagnostics.log(message);
+                } else {
+                    diagnostics.detail(message);
+                }
                 continue;
             }
         };
+        let elapsed = metadata_ms - previous_metadata_ms;
+        if last_update.elapsed() >= Duration::from_secs(5) {
+            diagnostics.log(format!("扫描仍在进行：phase={label} files={} 当前={rel_str:?} elapsed={:.2}ms metadata={metadata_ms:.2}ms", seen + 1, started.elapsed().as_secs_f64() * 1000.0));
+            last_update = Instant::now();
+        }
+        if elapsed >= 100.0 && diagnostics.enabled() {
+            slow_metadata.push((elapsed, rel_str.clone()));
+            slow_metadata.sort_by(|a, b| b.0.total_cmp(&a.0));
+            slow_metadata.truncate(3);
+        }
         map.insert(
             rel_str,
             FileMeta {
@@ -267,6 +310,13 @@ fn scan(
         }
     }
     progress(seen);
+    let total_ms = started.elapsed().as_secs_f64() * 1000.0;
+    diagnostics.log(format!("扫描完成：phase={label} files={seen} skipped={skipped}（symlink={symlinks} errors={scan_errors}）total={total_ms:.2}ms metadata={metadata_ms:.2}ms 其余遍历/整理={:.2}ms", (total_ms - metadata_ms).max(0.0)));
+    for (elapsed, path) in slow_metadata {
+        diagnostics.log(format!(
+            "慢metadata：phase={label} path={path:?} elapsed={elapsed:.2}ms"
+        ));
+    }
     Ok((map, skipped))
 }
 
@@ -351,9 +401,20 @@ fn newer_of(l: Option<&FileMeta>, r: Option<&FileMeta>) -> Option<String> {
 /// Convenience wrapper used by tests and as a stable API (no progress, empty
 /// baseline => behaves as a plain two-way / mirror compare).
 #[allow(dead_code)]
-pub fn compare(local: &Path, remote: &Path, opts: &CompareOptions) -> Result<CompareResult, String> {
+pub fn compare(
+    local: &Path,
+    remote: &Path,
+    opts: &CompareOptions,
+) -> Result<CompareResult, String> {
     let cancel = AtomicBool::new(false);
-    compare_with_progress(local, remote, opts, &Snapshot::default(), &cancel, &mut |_, _| {})
+    compare_with_progress(
+        local,
+        remote,
+        opts,
+        &Snapshot::default(),
+        &cancel,
+        &mut |_, _| {},
+    )
 }
 
 /// Compare two directory trees against a baseline snapshot and produce a
@@ -369,30 +430,72 @@ pub fn compare_with_progress(
     cancel: &AtomicBool,
     progress: &mut dyn FnMut(&str, usize),
 ) -> Result<CompareResult, String> {
+    compare_with_diagnostics(
+        local,
+        remote,
+        opts,
+        baseline,
+        cancel,
+        progress,
+        &Diagnostics::silent(),
+    )
+}
+
+pub fn compare_with_diagnostics(
+    local: &Path,
+    remote: &Path,
+    opts: &CompareOptions,
+    baseline: &Snapshot,
+    cancel: &AtomicBool,
+    progress: &mut dyn FnMut(&str, usize),
+    diagnostics: &Diagnostics,
+) -> Result<CompareResult, String> {
     let started = Instant::now();
     // Both walks are independent and usually bound by different devices (a
     // local disk vs. a network mount), so run them concurrently.
     let ((local_map, local_skipped), local_ms, (remote_map, remote_skipped), remote_ms) =
         std::thread::scope(|s| -> Result<_, String> {
             let (tx, rx) = mpsc::channel::<(&'static str, usize)>();
-            let walk = |root: &Path, phase: &'static str, tx: mpsc::Sender<(&'static str, usize)>| {
-                let t = Instant::now();
-                let res = scan(root, &opts.ignore, cancel, &mut |n| {
-                    let _ = tx.send((phase, n));
-                });
-                (res, t.elapsed().as_millis())
-            };
+            let walk =
+                |root: &Path, phase: &'static str, tx: mpsc::Sender<(&'static str, usize)>| {
+                    let t = Instant::now();
+                    let res = scan(
+                        root,
+                        &opts.ignore,
+                        cancel,
+                        &mut |n| {
+                            let _ = tx.send((phase, n));
+                        },
+                        diagnostics,
+                        phase,
+                    );
+                    (res, t.elapsed().as_millis())
+                };
             let local_tx = tx.clone();
             let local_worker = s.spawn(move || walk(local, "local", local_tx));
             let remote_worker = s.spawn(move || walk(remote, "remote", tx));
             for (phase, n) in rx {
                 progress(phase, n);
             }
-            let (l, lms) = local_worker.join().map_err(|_| "本地扫描线程异常退出".to_string())?;
-            let (r, rms) = remote_worker.join().map_err(|_| "远程扫描线程异常退出".to_string())?;
+            let (l, lms) = local_worker
+                .join()
+                .map_err(|_| "本地扫描线程异常退出".to_string())?;
+            let (r, rms) = remote_worker
+                .join()
+                .map_err(|_| "远程扫描线程异常退出".to_string())?;
             Ok((l?, lms, r?, rms))
         })?;
     let decide_started = Instant::now();
+    diagnostics.log(format!(
+        "差异决策开始：hash={}，基线条目={}，已存hash={}（此阶段含必要的内容哈希和排序）",
+        opts.use_hash,
+        baseline.files.len(),
+        baseline
+            .files
+            .values()
+            .filter(|entry| entry.hash.is_some())
+            .count()
+    ));
 
     let twoway = opts.mode == "twoway";
     let mirror_pull = opts.mode == "mirror_pull";
@@ -408,6 +511,10 @@ pub fn compare_with_progress(
 
     let mut entries: Vec<DiffEntry> = Vec::new();
     let mut counts = [0usize; 6]; // upload, download, delLocal, delRemote, conflict, same
+    let mut hash_candidates = 0usize;
+    let mut hash_decision_ms = 0.0;
+    let mut slow_hash: Vec<(f64, String)> = Vec::new();
+    let mut last_heartbeat = Instant::now();
 
     for rel in keys {
         if is_cancelled(cancel) {
@@ -418,6 +525,9 @@ pub fn compare_with_progress(
         let b = baseline.files.get(rel);
         let lp = local.join(rel);
         let rp = remote.join(rel);
+        let hash_candidate = opts.use_hash
+            && matches!((l, r), (Some(l), Some(r)) if l.size == r.size && !mtime_close(l.mtime, r.mtime));
+        let candidate_started = hash_candidate.then(Instant::now);
 
         let action = if twoway {
             decide_twoway(&lp, l, &rp, r, b, opts.use_hash, cancel)
@@ -426,6 +536,22 @@ pub fn compare_with_progress(
         } else {
             decide_mirror(&lp, l, &rp, r, opts.use_hash, b, cancel)
         };
+
+        if let Some(started) = candidate_started {
+            let elapsed = started.elapsed().as_secs_f64() * 1000.0;
+            hash_candidates += 1;
+            hash_decision_ms += elapsed;
+            diagnostics.detail(format!("哈希候选比较：path={rel:?} elapsed={elapsed:.2}ms"));
+            if elapsed >= 100.0 && diagnostics.enabled() {
+                slow_hash.push((elapsed, rel.clone()));
+                slow_hash.sort_by(|a, b| b.0.total_cmp(&a.0));
+                slow_hash.truncate(3);
+            }
+        }
+        if last_heartbeat.elapsed() >= Duration::from_secs(5) {
+            diagnostics.log(format!("差异决策仍在进行：当前 path={rel:?}，已检查hash候选={hash_candidates}，elapsed={:.2}ms", decide_started.elapsed().as_secs_f64() * 1000.0));
+            last_heartbeat = Instant::now();
+        }
 
         let action = match action {
             Some(a) => a,
@@ -485,6 +611,11 @@ pub fn compare_with_progress(
         decide_started.elapsed().as_millis(),
         started.elapsed().as_millis(),
     );
+    diagnostics.log(format!("对比完成：local_scan={local_ms}ms remote_scan={remote_ms}ms（两侧并行，不能相加）decision/hash/sort={:.2}ms total={:.2}ms changed={} same={}", decide_started.elapsed().as_secs_f64() * 1000.0, started.elapsed().as_secs_f64() * 1000.0, entries.len(), counts[5]));
+    diagnostics.log(format!("哈希候选比较：count={hash_candidates} 相关决策耗时={hash_decision_ms:.2}ms（含内容读取或缓存命中；不是额外可相加的阶段）"));
+    for (elapsed, path) in slow_hash {
+        diagnostics.log(format!("慢哈希候选：path={path:?} elapsed={elapsed:.2}ms"));
+    }
 
     Ok(CompareResult {
         entries,
@@ -594,12 +725,55 @@ fn decide_twoway(
 }
 
 /// Set a destination file's mtime to match the source (best-effort).
+#[cfg(test)]
 fn mirror_mtime(src: &Path, dst: &Path) {
-    if let Ok(meta) = fs::metadata(src) {
-        if let Ok(mtime) = meta.modified() {
-            let ft = filetime::FileTime::from_system_time(mtime);
-            let _ = filetime::set_file_mtime(dst, ft);
-        }
+    let _ = mirror_mtime_result(src, dst);
+}
+
+fn mirror_mtime_result(src: &Path, dst: &Path) -> Result<(), String> {
+    let mtime = fs::metadata(src)
+        .and_then(|meta| meta.modified())
+        .map_err(|e| e.to_string())?;
+    filetime::set_file_mtime(dst, filetime::FileTime::from_system_time(mtime))
+        .map_err(|e| e.to_string())
+}
+
+fn timed<T>(milliseconds: &mut f64, operation: impl FnOnce() -> T) -> T {
+    let started = Instant::now();
+    let result = operation();
+    *milliseconds += started.elapsed().as_secs_f64() * 1000.0;
+    result
+}
+
+#[derive(Debug, Clone, Default)]
+struct OpTimings {
+    exists_ms: f64,
+    mkdir_ms: f64,
+    open_ms: f64,
+    metadata_ms: f64,
+    create_ms: f64,
+    read_ms: f64,
+    write_ms: f64,
+    permissions_ms: f64,
+    close_ms: f64,
+    mtime_ms: f64,
+    rename_ms: f64,
+    delete_ms: f64,
+    fallback_ms: f64,
+    read_calls: u64,
+    write_calls: u64,
+    rename_error: Option<String>,
+    mtime_error: Option<String>,
+}
+
+impl OpTimings {
+    fn describe(&self) -> String {
+        format!("exists={:.2} mkdir={:.2} open={:.2} metadata={:.2} create={:.2} read={:.2}({}次) write={:.2}({}次) chmod={:.2} close={:.2} mtime={:.2} rename={:.2} delete={:.2} fallback={:.2}ms{}{}",
+            self.exists_ms, self.mkdir_ms, self.open_ms, self.metadata_ms, self.create_ms,
+            self.read_ms, self.read_calls, self.write_ms, self.write_calls, self.permissions_ms,
+            self.close_ms, self.mtime_ms, self.rename_ms, self.delete_ms, self.fallback_ms,
+            self.rename_error.as_ref().map(|e| format!(" rename_error={e:?}")).unwrap_or_default(),
+            self.mtime_error.as_ref().map(|e| format!(" mtime_error={e:?}")).unwrap_or_default())
     }
 }
 
@@ -611,9 +785,79 @@ fn mirror_mtime(src: &Path, dst: &Path) {
 /// unreliably and return ENOENT even when the temp file exists. In that case
 /// we fall back to a direct copy onto the destination, which works wherever
 /// writing the temp file worked.
+#[allow(dead_code)]
 pub fn copy_file_atomic(src: &Path, dst: &Path) -> Result<(), String> {
+    copy_file_atomic_with_progress(src, dst, &|_| {})
+}
+
+/// Count bytes after writes succeed, including bytes copied during a fallback.
+fn copy_file_with_progress(
+    src: &Path,
+    dst: &Path,
+    on_bytes: &(dyn Fn(u64) + Sync),
+    timings: &mut OpTimings,
+) -> Result<(), String> {
+    let mut source = timed(&mut timings.open_ms, || fs::File::open(src))
+        .map_err(|e| format!("复制失败: {e}"))?;
+    let meta = timed(&mut timings.metadata_ms, || source.metadata())
+        .map_err(|e| format!("复制失败: {e}"))?;
+    if !meta.is_file() {
+        return Err("复制失败: 源路径不是普通文件".into());
+    }
+    let mut destination = timed(&mut timings.create_ms, || fs::File::create(dst))
+        .map_err(|e| format!("复制失败: {e}"))?;
+    let mut buffer = vec![0u8; 256 * 1024];
+    loop {
+        timings.read_calls += 1;
+        let count = match timed(&mut timings.read_ms, || source.read(&mut buffer)) {
+            Ok(0) => break,
+            Ok(count) => count,
+            Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+            Err(e) => return Err(format!("复制失败: {e}")),
+        };
+        let mut remaining = &buffer[..count];
+        while !remaining.is_empty() {
+            timings.write_calls += 1;
+            match timed(&mut timings.write_ms, || destination.write(remaining)) {
+                Ok(0) => return Err("复制失败: 写入未取得进展".into()),
+                Ok(written) => {
+                    on_bytes(written as u64);
+                    remaining = &remaining[written..];
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::Interrupted => continue,
+                Err(e) => return Err(format!("复制失败: {e}")),
+            }
+        }
+    }
+    let result = timed(&mut timings.permissions_ms, || {
+        destination.set_permissions(meta.permissions())
+    })
+    .map_err(|e| format!("复制失败: {e}"));
+    // FUSE/SFTP mounts may defer work until close; keep this separate from write().
+    timed(&mut timings.close_ms, || {
+        drop(destination);
+        drop(source);
+    });
+    result
+}
+
+fn copy_file_atomic_with_progress(
+    src: &Path,
+    dst: &Path,
+    on_bytes: &(dyn Fn(u64) + Sync),
+) -> Result<(), String> {
+    copy_file_measured(src, dst, on_bytes, &mut OpTimings::default())
+}
+
+fn copy_file_measured(
+    src: &Path,
+    dst: &Path,
+    on_bytes: &(dyn Fn(u64) + Sync),
+    timings: &mut OpTimings,
+) -> Result<(), String> {
     if let Some(parent) = dst.parent() {
-        fs::create_dir_all(parent).map_err(|e| format!("创建目录失败: {e}"))?;
+        timed(&mut timings.mkdir_ms, || fs::create_dir_all(parent))
+            .map_err(|e| format!("创建目录失败: {e}"))?;
     }
     let tmp: PathBuf = {
         let mut p = dst.to_path_buf();
@@ -627,19 +871,28 @@ pub fn copy_file_atomic(src: &Path, dst: &Path) -> Result<(), String> {
         p
     };
 
-    fs::copy(src, &tmp).map_err(|e| format!("复制失败: {e}"))?;
-    mirror_mtime(src, &tmp);
+    copy_file_with_progress(src, &tmp, on_bytes, timings)?;
+    if let Err(error) = timed(&mut timings.mtime_ms, || mirror_mtime_result(src, &tmp)) {
+        timings.mtime_error = Some(error);
+    }
 
-    match fs::rename(&tmp, dst) {
+    match timed(&mut timings.rename_ms, || fs::rename(&tmp, dst)) {
         Ok(_) => Ok(()),
-        Err(_) => {
+        Err(error) => {
+            timings.rename_error = Some(format!(
+                "{error}; kind={:?}; os={:?}",
+                error.kind(),
+                error.raw_os_error()
+            ));
             // Fallback for mounts where rename is unreliable (gvfs/NFS).
-            let direct = fs::copy(src, dst)
-                .map(|_| ())
-                .map_err(|e| format!("复制失败: {e}"));
-            let _ = fs::remove_file(&tmp);
+            let fallback_started = Instant::now();
+            let direct = copy_file_with_progress(src, dst, on_bytes, timings);
+            timings.fallback_ms += fallback_started.elapsed().as_secs_f64() * 1000.0;
+            let _ = timed(&mut timings.delete_ms, || fs::remove_file(&tmp));
             if direct.is_ok() {
-                mirror_mtime(src, dst);
+                if let Err(error) = timed(&mut timings.mtime_ms, || mirror_mtime_result(src, dst)) {
+                    timings.mtime_error = Some(error);
+                }
             }
             direct
         }
@@ -673,6 +926,56 @@ pub struct OpProgress {
     pub ok: bool,
     pub skipped: bool,
     pub error: Option<String>,
+    pub elapsed_ms: f64,
+    pub bytes_copied: u64,
+}
+
+/// Aggregate file-copy throughput across all workers (not network wire speed).
+#[derive(Debug, Clone, Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct TransferProgress {
+    pub bytes_copied: u64,
+    pub bytes_per_second: f64,
+    pub elapsed_seconds: f64,
+    pub finished: bool,
+}
+
+fn report_transfer(
+    bytes: &AtomicU64,
+    started: Instant,
+    stop: mpsc::Receiver<()>,
+    progress: &(dyn Fn(TransferProgress) + Sync),
+) {
+    let mut previous_time = started;
+    let mut previous_bytes = 0;
+    loop {
+        let finished = !matches!(
+            stop.recv_timeout(Duration::from_millis(500)),
+            Err(mpsc::RecvTimeoutError::Timeout)
+        );
+        let now = Instant::now();
+        let bytes_copied = bytes.load(Ordering::Relaxed);
+        let elapsed_seconds = now.duration_since(started).as_secs_f64();
+        let (rate_bytes, rate_seconds) = if finished {
+            (bytes_copied, elapsed_seconds)
+        } else {
+            (
+                bytes_copied - previous_bytes,
+                now.duration_since(previous_time).as_secs_f64(),
+            )
+        };
+        progress(TransferProgress {
+            bytes_copied,
+            bytes_per_second: rate_bytes as f64 / rate_seconds.max(f64::EPSILON),
+            elapsed_seconds,
+            finished,
+        });
+        if finished {
+            break;
+        }
+        previous_time = now;
+        previous_bytes = bytes_copied;
+    }
 }
 
 /// Summary returned when a sync run completes.
@@ -692,6 +995,8 @@ pub struct SyncResult {
     /// Relative paths whose op succeeded; only filled for cancelled runs so the
     /// UI can update its diff list without a full re-compare.
     pub done_paths: Vec<String>,
+    pub bytes_copied: u64,
+    pub elapsed_seconds: f64,
 }
 
 /// Outcome of a single op: either performed, or skipped because the file
@@ -701,18 +1006,24 @@ enum OpOutcome {
     Skipped,
 }
 
-fn exec_op(local: &Path, remote: &Path, op: &SyncOp) -> Result<OpOutcome, String> {
+fn exec_op(
+    local: &Path,
+    remote: &Path,
+    op: &SyncOp,
+    on_bytes: &(dyn Fn(u64) + Sync),
+    timings: &mut OpTimings,
+) -> Result<OpOutcome, String> {
     let lp = local.join(&op.rel_path);
     let rp = remote.join(&op.rel_path);
     match op.op.as_str() {
         "upload" => {
-            if !lp.exists() {
+            if !timed(&mut timings.exists_ms, || lp.exists()) {
                 return Ok(OpOutcome::Skipped);
             }
-            match copy_file_atomic(&lp, &rp) {
+            match copy_file_measured(&lp, &rp, on_bytes, timings) {
                 Ok(_) => Ok(OpOutcome::Done),
                 // If it failed because the source raced away, skip quietly.
-                Err(e) if !lp.exists() => {
+                Err(e) if !timed(&mut timings.exists_ms, || lp.exists()) => {
                     let _ = e;
                     Ok(OpOutcome::Skipped)
                 }
@@ -720,12 +1031,12 @@ fn exec_op(local: &Path, remote: &Path, op: &SyncOp) -> Result<OpOutcome, String
             }
         }
         "download" => {
-            if !rp.exists() {
+            if !timed(&mut timings.exists_ms, || rp.exists()) {
                 return Ok(OpOutcome::Skipped);
             }
-            match copy_file_atomic(&rp, &lp) {
+            match copy_file_measured(&rp, &lp, on_bytes, timings) {
                 Ok(_) => Ok(OpOutcome::Done),
-                Err(e) if !rp.exists() => {
+                Err(e) if !timed(&mut timings.exists_ms, || rp.exists()) => {
                     let _ = e;
                     Ok(OpOutcome::Skipped)
                 }
@@ -733,16 +1044,16 @@ fn exec_op(local: &Path, remote: &Path, op: &SyncOp) -> Result<OpOutcome, String
             }
         }
         "delLocal" => {
-            if !lp.exists() {
+            if !timed(&mut timings.exists_ms, || lp.exists()) {
                 return Ok(OpOutcome::Skipped); // already gone == success
             }
-            delete_file(&lp).map(|_| OpOutcome::Done)
+            timed(&mut timings.delete_ms, || delete_file(&lp)).map(|_| OpOutcome::Done)
         }
         "delRemote" => {
-            if !rp.exists() {
+            if !timed(&mut timings.exists_ms, || rp.exists()) {
                 return Ok(OpOutcome::Skipped);
             }
-            delete_file(&rp).map(|_| OpOutcome::Done)
+            timed(&mut timings.delete_ms, || delete_file(&rp)).map(|_| OpOutcome::Done)
         }
         other => Err(format!("未知操作: {other}")),
     }
@@ -751,6 +1062,7 @@ fn exec_op(local: &Path, remote: &Path, op: &SyncOp) -> Result<OpOutcome, String
 /// Apply operations in parallel with a bounded worker pool. `progress` is
 /// invoked (from worker threads) as each op completes. Once `cancel` is set,
 /// workers finish the file they are copying and take no further ops.
+#[allow(dead_code)]
 pub fn apply_ops(
     local: &Path,
     remote: &Path,
@@ -759,84 +1071,256 @@ pub fn apply_ops(
     cancel: &AtomicBool,
     progress: &(dyn Fn(OpProgress) + Sync),
 ) -> SyncResult {
+    apply_ops_with_transfer_progress(local, remote, ops, concurrency, cancel, progress, &|_| {})
+}
+
+pub fn apply_ops_with_transfer_progress(
+    local: &Path,
+    remote: &Path,
+    ops: &[SyncOp],
+    concurrency: usize,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(OpProgress) + Sync),
+    transfer: &(dyn Fn(TransferProgress) + Sync),
+) -> SyncResult {
+    apply_ops_with_diagnostics(
+        local,
+        remote,
+        ops,
+        concurrency,
+        cancel,
+        progress,
+        transfer,
+        &Diagnostics::silent(),
+    )
+}
+
+pub fn apply_ops_with_diagnostics(
+    local: &Path,
+    remote: &Path,
+    ops: &[SyncOp],
+    concurrency: usize,
+    cancel: &AtomicBool,
+    progress: &(dyn Fn(OpProgress) + Sync),
+    transfer: &(dyn Fn(TransferProgress) + Sync),
+    diagnostics: &Diagnostics,
+) -> SyncResult {
+    let started = Instant::now();
+    let bytes_copied = AtomicU64::new(0);
+    let on_bytes = |count| {
+        bytes_copied.fetch_add(count, Ordering::Relaxed);
+    };
     let total = ops.len();
     let next = AtomicUsize::new(0);
     let done = AtomicUsize::new(0);
     let res = Mutex::new(SyncResult::default());
     let workers = concurrency.clamp(1, 32);
+    let samples = Mutex::new(Vec::new());
+    diagnostics.log(format!(
+        "文件操作开始：任务={}，worker={}，不含后续快照/重新对比",
+        total, workers
+    ));
 
-    std::thread::scope(|s| {
-        for _ in 0..workers {
-            s.spawn(|| loop {
-                if is_cancelled(cancel) {
-                    break;
-                }
-                let i = next.fetch_add(1, Ordering::Relaxed);
-                if i >= total {
-                    break;
-                }
-                let op = &ops[i];
-                let result = exec_op(local, remote, op);
-                let d = done.fetch_add(1, Ordering::Relaxed) + 1;
-                let (ok, skipped, err) = match &result {
-                    Ok(OpOutcome::Done) => {
-                        let mut g = res.lock().unwrap();
-                        match op.op.as_str() {
-                            "upload" => g.uploaded += 1,
-                            "download" => g.downloaded += 1,
-                            "delLocal" => g.deleted_local += 1,
-                            "delRemote" => g.deleted_remote += 1,
-                            _ => {}
+    std::thread::scope(|reporter| {
+        let (stop, stopped) = mpsc::channel();
+        let bytes = &bytes_copied;
+        reporter.spawn(move || report_transfer(bytes, started, stopped, transfer));
+        std::thread::scope(|s| {
+            for _ in 0..workers {
+                s.spawn(|| loop {
+                    if is_cancelled(cancel) {
+                        break;
+                    }
+                    let i = next.fetch_add(1, Ordering::Relaxed);
+                    if i >= total {
+                        break;
+                    }
+                    let op = &ops[i];
+                    diagnostics.detail(format!("文件开始：op={} path={:?}", op.op, op.rel_path));
+                    let operation_started = Instant::now();
+                    let operation_bytes = AtomicU64::new(0);
+                    let count_bytes = |count| {
+                        operation_bytes.fetch_add(count, Ordering::Relaxed);
+                        on_bytes(count);
+                    };
+                    let mut timings = OpTimings::default();
+                    let result = exec_op(local, remote, op, &count_bytes, &mut timings);
+                    let elapsed_ms = operation_started.elapsed().as_secs_f64() * 1000.0;
+                    let copied = operation_bytes.load(Ordering::Relaxed);
+                    let d = done.fetch_add(1, Ordering::Relaxed) + 1;
+                    let (ok, skipped, err) = match &result {
+                        Ok(OpOutcome::Done) => {
+                            let mut g = res.lock().unwrap();
+                            match op.op.as_str() {
+                                "upload" => g.uploaded += 1,
+                                "download" => g.downloaded += 1,
+                                "delLocal" => g.deleted_local += 1,
+                                "delRemote" => g.deleted_remote += 1,
+                                _ => {}
+                            }
+                            g.done_paths.push(op.rel_path.clone());
+                            (true, false, None)
                         }
-                        g.done_paths.push(op.rel_path.clone());
-                        (true, false, None)
+                        Ok(OpOutcome::Skipped) => {
+                            let mut g = res.lock().unwrap();
+                            g.skipped += 1;
+                            (true, true, None)
+                        }
+                        Err(e) => {
+                            let mut g = res.lock().unwrap();
+                            g.failed += 1;
+                            g.errors.push(format!("{}: {}", op.rel_path, e));
+                            (false, false, Some(e.clone()))
+                        }
+                    };
+                    if diagnostics.enabled() {
+                        let sample = OpSample {
+                            path: op.rel_path.clone(),
+                            op: op.op.clone(),
+                            elapsed_ms,
+                            bytes: copied,
+                            timings,
+                        };
+                        diagnostics.detail(format!(
+                            "文件结束：{} ok={} skipped={} error={err:?}",
+                            sample.describe(),
+                            ok,
+                            skipped
+                        ));
+                        samples.lock().unwrap().push(sample);
                     }
-                    Ok(OpOutcome::Skipped) => {
-                        let mut g = res.lock().unwrap();
-                        g.skipped += 1;
-                        (true, true, None)
-                    }
-                    Err(e) => {
-                        let mut g = res.lock().unwrap();
-                        g.failed += 1;
-                        g.errors.push(format!("{}: {}", op.rel_path, e));
-                        (false, false, Some(e.clone()))
-                    }
-                };
-                progress(OpProgress {
-                    index: d,
-                    total,
-                    rel_path: op.rel_path.clone(),
-                    op: op.op.clone(),
-                    ok,
-                    skipped,
-                    error: err,
+                    progress(OpProgress {
+                        index: d,
+                        total,
+                        rel_path: op.rel_path.clone(),
+                        op: op.op.clone(),
+                        ok,
+                        skipped,
+                        error: err,
+                        elapsed_ms,
+                        bytes_copied: copied,
+                    });
                 });
-            });
-        }
+            }
+        });
+        let _ = stop.send(());
     });
 
     let mut res = res.into_inner().unwrap();
+    res.bytes_copied = bytes_copied.load(Ordering::Relaxed);
+    res.elapsed_seconds = started.elapsed().as_secs_f64();
     res.cancelled = done.load(Ordering::Relaxed) < total;
     if !res.cancelled {
         res.done_paths = Vec::new();
     }
+    diagnostics.log(format!(
+        "文件操作完成：wall={:.2}ms，已处理={}/{}，bytes={}，失败={}，跳过={}，cancelled={}",
+        res.elapsed_seconds * 1000.0,
+        done.load(Ordering::Relaxed),
+        total,
+        res.bytes_copied,
+        res.failed,
+        res.skipped,
+        res.cancelled
+    ));
+    summarize_operations(samples.into_inner().unwrap(), diagnostics);
     res
+}
+
+struct OpSample {
+    path: String,
+    op: String,
+    elapsed_ms: f64,
+    bytes: u64,
+    timings: OpTimings,
+}
+
+impl OpSample {
+    fn describe(&self) -> String {
+        format!(
+            "op={} path={:?} bytes={} total={:.2}ms；分段(ms)：{}",
+            self.op,
+            self.path,
+            self.bytes,
+            self.elapsed_ms,
+            self.timings.describe()
+        )
+    }
+}
+
+fn summarize_operations(mut samples: Vec<OpSample>, diagnostics: &Diagnostics) {
+    if samples.is_empty() {
+        return;
+    }
+    samples.sort_by(|a, b| a.elapsed_ms.total_cmp(&b.elapsed_ms));
+    let count = samples.len();
+    let percentile =
+        |p: f64| samples[((count as f64 * p).ceil() as usize).saturating_sub(1)].elapsed_ms;
+    let sum: f64 = samples.iter().map(|s| s.elapsed_ms).sum();
+    let read_ms: f64 = samples.iter().map(|s| s.timings.read_ms).sum();
+    let write_ms: f64 = samples.iter().map(|s| s.timings.write_ms).sum();
+    let close_ms: f64 = samples.iter().map(|s| s.timings.close_ms).sum();
+    let metadata_ms: f64 = samples
+        .iter()
+        .map(|s| {
+            s.timings.exists_ms
+                + s.timings.mkdir_ms
+                + s.timings.open_ms
+                + s.timings.metadata_ms
+                + s.timings.create_ms
+                + s.timings.permissions_ms
+                + s.timings.mtime_ms
+                + s.timings.rename_ms
+                + s.timings.delete_ms
+        })
+        .sum();
+    diagnostics.log(format!("文件耗时分布：n={count} avg={:.2}ms p50={:.2}ms p95={:.2}ms max={:.2}ms；rename回退={}次 mtime失败={}次", sum / count as f64, percentile(0.5), percentile(0.95), samples.last().unwrap().elapsed_ms, samples.iter().filter(|s| s.timings.rename_error.is_some()).count(), samples.iter().filter(|s| s.timings.mtime_error.is_some()).count()));
+    diagnostics.log(format!("累计线程耗时：read={read_ms:.2}ms write={write_ms:.2}ms close={close_ms:.2}ms 元数据/目录/重命名={metadata_ms:.2}ms（并发项会重叠，不能当作实际总等待时间）"));
+    for (index, sample) in samples.iter().rev().take(5).enumerate() {
+        diagnostics.log(format!("慢文件TOP{}：{}", index + 1, sample.describe()));
+    }
 }
 
 /// Rebuild a baseline snapshot from the *current* state of both sides: record
 /// every file that is now equal on both sides. Used after a sync completes so
 /// the next comparison has an accurate baseline.
+#[allow(dead_code)]
 pub fn build_snapshot(local: &Path, remote: &Path, ignore: &[String]) -> Snapshot {
+    build_snapshot_with_diagnostics(local, remote, ignore, &Diagnostics::silent())
+}
+
+pub fn build_snapshot_with_diagnostics(
+    local: &Path,
+    remote: &Path,
+    ignore: &[String],
+    diagnostics: &Diagnostics,
+) -> Snapshot {
+    let started = Instant::now();
+    diagnostics.log("快照重建开始：重新全量扫描两端（本地、远程依次扫描）");
     let mut noop = |_: usize| {};
     let never = AtomicBool::new(false);
-    let local_map = scan(local, ignore, &never, &mut noop)
-        .map(|(m, _)| m)
-        .unwrap_or_default();
-    let remote_map = scan(remote, ignore, &never, &mut noop)
-        .map(|(m, _)| m)
-        .unwrap_or_default();
+    let local_map = scan(
+        local,
+        ignore,
+        &never,
+        &mut noop,
+        diagnostics,
+        "snapshot-local",
+    )
+    .map(|(m, _)| m)
+    .unwrap_or_default();
+    let remote_map = scan(
+        remote,
+        ignore,
+        &never,
+        &mut noop,
+        diagnostics,
+        "snapshot-remote",
+    )
+    .map(|(m, _)| m)
+    .unwrap_or_default();
 
+    let merge_started = Instant::now();
     let mut snap = Snapshot::default();
     for (rel, lm) in &local_map {
         if let Some(rm) = remote_map.get(rel) {
@@ -852,6 +1336,7 @@ pub fn build_snapshot(local: &Path, remote: &Path, ignore: &[String]) -> Snapsho
             }
         }
     }
+    diagnostics.log(format!("快照重建完成：local_files={} remote_files={} baseline_files={} merge={:.2}ms total={:.2}ms", local_map.len(), remote_map.len(), snap.files.len(), merge_started.elapsed().as_secs_f64() * 1000.0, started.elapsed().as_secs_f64() * 1000.0));
     snap
 }
 
@@ -1203,8 +1688,15 @@ mod tests {
             );
         }
 
-        let res =
-            compare_with_progress(&local, &remote, &opts("twoway"), &base, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+        let res = compare_with_progress(
+            &local,
+            &remote,
+            &opts("twoway"),
+            &base,
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+        )
+        .unwrap();
 
         // local-deleted + remote-unchanged baseline file -> delete remote
         assert_eq!(find(&res, "gone.txt").action, Action::DeleteRemote);
@@ -1233,8 +1725,15 @@ mod tests {
             },
         );
 
-        let res =
-            compare_with_progress(&local, &remote, &opts("twoway"), &base, &AtomicBool::new(false), &mut |_, _| {}).unwrap();
+        let res = compare_with_progress(
+            &local,
+            &remote,
+            &opts("twoway"),
+            &base,
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+        )
+        .unwrap();
         assert_eq!(find(&res, "f.txt").action, Action::Conflict);
 
         fs::remove_dir_all(&local).ok();
@@ -1262,8 +1761,19 @@ mod tests {
         assert_eq!(res.uploaded, 1);
         assert_eq!(res.downloaded, 1);
         assert_eq!(res.failed, 0);
-        assert_eq!(fs::read_to_string(remote.join("up/a.txt")).unwrap(), "to upload");
-        assert_eq!(fs::read_to_string(local.join("down/b.txt")).unwrap(), "to download");
+        assert_eq!(
+            res.bytes_copied,
+            ("to upload".len() + "to download".len()) as u64
+        );
+        assert!(res.elapsed_seconds > 0.0);
+        assert_eq!(
+            fs::read_to_string(remote.join("up/a.txt")).unwrap(),
+            "to upload"
+        );
+        assert_eq!(
+            fs::read_to_string(local.join("down/b.txt")).unwrap(),
+            "to download"
+        );
 
         // After sync both sides match; snapshot should record both files.
         let snap = build_snapshot(&local, &remote, &[]);
@@ -1371,6 +1881,7 @@ mod tests {
         assert_eq!(res.failed, 0);
         assert_eq!(res.skipped, 1);
         assert!(!res.cancelled);
+        assert_eq!(res.bytes_copied, 0);
 
         fs::remove_dir_all(&local).ok();
         fs::remove_dir_all(&remote).ok();
@@ -1398,7 +1909,10 @@ mod tests {
         let anchored = ig(&["slam_ws/build"]);
         assert!(is_ignored("slam_ws/build/a", &anchored));
         assert!(!is_ignored("other/slam_ws/build/a", &anchored));
-        assert!(is_ignored("other/slam_ws/build/a", &ig(&["**/slam_ws/build"])));
+        assert!(is_ignored(
+            "other/slam_ws/build/a",
+            &ig(&["**/slam_ws/build"])
+        ));
     }
 
     #[test]
@@ -1458,9 +1972,233 @@ mod tests {
         let res = apply_ops(&local, &remote, &ops, 2, &AtomicBool::new(true), &|_p| {});
         assert!(res.cancelled);
         assert_eq!(res.uploaded, 0);
+        assert_eq!(res.bytes_copied, 0);
         assert!(!remote.join("a.txt").exists());
 
         fs::remove_dir_all(&local).ok();
         fs::remove_dir_all(&remote).ok();
+    }
+
+    #[test]
+    fn tracked_copy_counts_chunks_and_keeps_destination_until_complete() {
+        let local = tmp_dir("bytes_local");
+        let remote = tmp_dir("bytes_remote");
+        let source = local.join("payload.bin");
+        let destination = remote.join("payload.bin");
+        let payload: Vec<u8> = (0..(700 * 1024 + 17)).map(|i| (i % 251) as u8).collect();
+        fs::write(&source, &payload).unwrap();
+        fs::write(&destination, b"original").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            fs::set_permissions(&source, fs::Permissions::from_mode(0o750)).unwrap();
+        }
+        let copied = AtomicU64::new(0);
+        let chunks = AtomicUsize::new(0);
+        copy_file_atomic_with_progress(&source, &destination, &|bytes| {
+            copied.fetch_add(bytes, Ordering::Relaxed);
+            chunks.fetch_add(1, Ordering::Relaxed);
+            assert_eq!(fs::read(&destination).unwrap(), b"original");
+        })
+        .unwrap();
+        assert_eq!(copied.load(Ordering::Relaxed), payload.len() as u64);
+        assert!(chunks.load(Ordering::Relaxed) > 1);
+        assert_eq!(fs::read(&destination).unwrap(), payload);
+        assert!(!remote.join(".payload.bin.synctmp").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                fs::metadata(&destination).unwrap().permissions().mode() & 0o777,
+                0o750
+            );
+        }
+        fs::remove_dir_all(&local).unwrap();
+        fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn transfer_reports_live_rate_and_final_total_without_file_completion() {
+        let bytes = AtomicU64::new(4096);
+        let (stop, stopped) = mpsc::channel();
+        let (events, received) = mpsc::channel();
+        std::thread::scope(|s| {
+            let bytes_ref = &bytes;
+            s.spawn(move || {
+                report_transfer(bytes_ref, Instant::now(), stopped, &|p| {
+                    events.send(p).unwrap();
+                })
+            });
+            let live = received.recv_timeout(Duration::from_secs(5)).unwrap();
+            assert!(!live.finished);
+            assert_eq!(live.bytes_copied, 4096);
+            assert!(live.bytes_per_second.is_finite() && live.bytes_per_second > 0.0);
+            bytes.store(8192, Ordering::Relaxed);
+            stop.send(()).unwrap();
+            loop {
+                let final_event = received.recv_timeout(Duration::from_secs(5)).unwrap();
+                if final_event.finished {
+                    assert_eq!(final_event.bytes_copied, 8192);
+                    assert!(final_event.elapsed_seconds > 0.0);
+                    assert_eq!(
+                        final_event.bytes_per_second,
+                        8192.0 / final_event.elapsed_seconds
+                    );
+                    break;
+                }
+            }
+        });
+    }
+
+    #[test]
+    fn transfer_total_aggregates_workers_and_excludes_deletes_and_skips() {
+        let local = tmp_dir("total_local");
+        let remote = tmp_dir("total_remote");
+        write(&local, "up.bin", "upload payload");
+        write(&remote, "down.bin", "download payload");
+        write(&remote, "delete.bin", "not transferred");
+        let ops: Vec<SyncOp> = [
+            ("up.bin", "upload"),
+            ("down.bin", "download"),
+            ("delete.bin", "delRemote"),
+            ("missing.bin", "upload"),
+        ]
+        .iter()
+        .map(|(rel, op)| SyncOp {
+            rel_path: (*rel).into(),
+            op: (*op).into(),
+        })
+        .collect();
+        let events = Mutex::new(Vec::new());
+        let result = apply_ops_with_transfer_progress(
+            &local,
+            &remote,
+            &ops,
+            4,
+            &AtomicBool::new(false),
+            &|_| {},
+            &|p| events.lock().unwrap().push(p),
+        );
+        assert_eq!(
+            result.bytes_copied,
+            ("upload payload".len() + "download payload".len()) as u64
+        );
+        assert_eq!(result.uploaded, 1);
+        assert_eq!(result.downloaded, 1);
+        assert_eq!(result.deleted_remote, 1);
+        assert_eq!(result.skipped, 1);
+        assert_eq!(result.failed, 0);
+        let events = events.into_inner().unwrap();
+        let last = events.last().unwrap();
+        assert!(last.finished);
+        assert_eq!(last.bytes_copied, result.bytes_copied);
+        assert!(last.bytes_per_second.is_finite());
+        fs::remove_dir_all(&local).unwrap();
+        fs::remove_dir_all(&remote).unwrap();
+    }
+
+    #[test]
+    fn diagnostics_cover_real_transfer_snapshot_and_compare_phases() {
+        let local = tmp_dir("diagnostic_local");
+        let remote = tmp_dir("diagnostic_remote");
+        let logs = tmp_dir("diagnostic_logs");
+        write(&local, "upload.txt", "from local");
+        write(&remote, "download.txt", "from remote");
+        let lines = std::sync::Arc::new(Mutex::new(Vec::new()));
+        let captured = lines.clone();
+        let diagnostics = Diagnostics::new("integration", Some(&logs), move |line| {
+            captured.lock().unwrap().push(line.to_string())
+        });
+        let ops = vec![
+            SyncOp {
+                rel_path: "upload.txt".into(),
+                op: "upload".into(),
+            },
+            SyncOp {
+                rel_path: "download.txt".into(),
+                op: "download".into(),
+            },
+        ];
+        let progress = Mutex::new(Vec::new());
+        let result = apply_ops_with_diagnostics(
+            &local,
+            &remote,
+            &ops,
+            2,
+            &AtomicBool::new(false),
+            &|p| progress.lock().unwrap().push(p),
+            &|_| {},
+            &diagnostics,
+        );
+        assert_eq!(result.failed, 0);
+        assert_eq!(result.bytes_copied, 21);
+        let progress = progress.into_inner().unwrap();
+        assert_eq!(progress.len(), 2);
+        assert!(progress
+            .iter()
+            .all(|p| p.elapsed_ms.is_finite() && p.elapsed_ms >= 0.0 && p.bytes_copied > 0));
+        let snapshot = build_snapshot_with_diagnostics(&local, &remote, &[], &diagnostics);
+        assert_eq!(snapshot.files.len(), 2);
+        let compared = compare_with_diagnostics(
+            &local,
+            &remote,
+            &opts("twoway"),
+            &snapshot,
+            &AtomicBool::new(false),
+            &mut |_, _| {},
+            &diagnostics,
+        )
+        .unwrap();
+        assert_eq!(compared.same_count, 2);
+        assert!(compared.entries.is_empty());
+        diagnostics.flush();
+        let visible = lines.lock().unwrap().join("\n");
+        assert!(visible.contains("文件耗时分布：n=2"));
+        assert!(visible.contains("慢文件TOP1"));
+        assert!(visible.contains("phase=snapshot-local"));
+        assert!(visible.contains("phase=snapshot-remote"));
+        assert!(visible.contains("快照重建完成"));
+        assert!(visible.contains("decision/hash/sort="));
+        let path = fs::read_dir(&logs).unwrap().next().unwrap().unwrap().path();
+        let full = fs::read_to_string(path).unwrap();
+        assert_eq!(full.matches("文件开始：").count(), 2);
+        assert_eq!(full.matches("文件结束：").count(), 2);
+        assert!(full.contains("close="));
+        assert!(full.contains("read="));
+        assert!(full.contains("rename="));
+        drop(diagnostics);
+        fs::remove_dir_all(local).unwrap();
+        fs::remove_dir_all(remote).unwrap();
+        fs::remove_dir_all(logs).unwrap();
+    }
+
+    #[test]
+    fn failed_rename_records_fallback_cause_without_destroying_destination() {
+        let root = tmp_dir("diagnostic_rename");
+        let source = root.join("source.txt");
+        let destination = root.join("occupied");
+        fs::write(&source, "payload").unwrap();
+        fs::create_dir(&destination).unwrap();
+        fs::write(destination.join("keep.txt"), "keep").unwrap();
+        let mut timings = OpTimings::default();
+        let bytes = AtomicU64::new(0);
+        let result = copy_file_measured(
+            &source,
+            &destination,
+            &|count| {
+                bytes.fetch_add(count, Ordering::Relaxed);
+            },
+            &mut timings,
+        );
+        assert!(result.is_err());
+        assert!(timings.rename_error.is_some());
+        assert!(timings.fallback_ms.is_finite() && timings.fallback_ms >= 0.0);
+        assert_eq!(bytes.load(Ordering::Relaxed), 7);
+        assert_eq!(
+            fs::read_to_string(destination.join("keep.txt")).unwrap(),
+            "keep"
+        );
+        assert!(!root.join(".occupied.synctmp").exists());
+        fs::remove_dir_all(root).unwrap();
     }
 }
