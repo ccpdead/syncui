@@ -35,14 +35,16 @@ if [[ ! -d node_modules ]]; then
   npm install
 fi
 
+./scripts/build-tools.sh
+
 echo "Building with CARGO_BUILD_JOBS=${CARGO_BUILD_JOBS}..."
 build_marker="$(mktemp)"
 trap 'rm -f "$build_marker"' EXIT
-npm run tauri build
+npm run tauri build -- "$@"
 
 # The .deb must never be named "sync-ui": that is Ubuntu's SyncEvolution GUI,
 # and unattended-upgrades would silently replace our app with it.
-if command -v dpkg-deb >/dev/null 2>&1; then
+if command -v dpkg-deb >/dev/null 2>&1 && [[ "$*" != *"--bundles appimage"* ]]; then
   mapfile -t debs < <(find src-tauri/target/release/bundle/deb -maxdepth 1 -type f -name '*.deb' -newer "$build_marker")
   if (( ${#debs[@]} == 0 )); then
     echo "error: no freshly built .deb found." >&2

@@ -10,6 +10,7 @@ import {
   DiffEntry,
   FileTextPair,
   WriteSide,
+  RemoteEndpoint,
 } from "./api";
 
 type ViewMode = "side" | "unified";
@@ -84,6 +85,8 @@ export interface DiffDrawerProps {
   entry: DiffEntry;
   localRoot: string;
   remoteRoot: string;
+  remoteEndpoint?: RemoteEndpoint;
+  disabled?: boolean;
   options: CompareOptions;
   onClose: () => void;
   /** Called after a successful save + recompare. `null` means path vanished. */
@@ -96,6 +99,8 @@ export default function DiffDrawer({
   entry,
   localRoot,
   remoteRoot,
+  remoteEndpoint,
+  disabled = false,
   options,
   onClose,
   onEntryUpdated,
@@ -120,7 +125,7 @@ export default function DiffDrawer({
     setLoadError(null);
     setStatus(null);
     try {
-      const p = await readFilePair(localRoot, remoteRoot, entry.relPath);
+      const p = await readFilePair(localRoot, remoteRoot, entry.relPath, remoteEndpoint);
       setPair(p);
       const l = p.local.content ?? "";
       const r = p.remote.content ?? "";
@@ -134,7 +139,7 @@ export default function DiffDrawer({
     } finally {
       setLoading(false);
     }
-  }, [localRoot, remoteRoot, entry.relPath]);
+  }, [localRoot, remoteRoot, entry.relPath, remoteEndpoint]);
 
   useEffect(() => {
     void reload();
@@ -151,7 +156,7 @@ export default function DiffDrawer({
   const localBlock = pair ? sideBlocked(pair.local) : null;
   const remoteBlock = pair ? sideBlocked(pair.remote) : null;
   const canEdit =
-    !!pair &&
+    !disabled && !!pair &&
     !localBlock &&
     !remoteBlock &&
     pair.local.content != null &&
@@ -179,11 +184,12 @@ export default function DiffDrawer({
     setStatus(null);
     try {
       const content = side === "local" ? localText : remoteText;
-      await writeFileText(localRoot, remoteRoot, entry.relPath, side, content);
+      const version = await writeFileText(localRoot, remoteRoot, entry.relPath, side, content, side === "local" ? pair?.localVersion : pair?.remoteVersion, remoteEndpoint);
+      setPair(p => p ? {...p, [side === "local" ? "localVersion" : "remoteVersion"]: version} : p);
       if (side === "local") setSavedLocal(content);
       else setSavedRemote(content);
 
-      const updated = await compareOneEntry(localRoot, remoteRoot, entry.relPath, options);
+      const updated = await compareOneEntry(localRoot, remoteRoot, entry.relPath, options, remoteEndpoint);
       onEntryUpdated(updated);
       setStatus(
         updated == null

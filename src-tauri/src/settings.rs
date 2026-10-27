@@ -11,6 +11,8 @@ const SETTINGS_FILE: &str = "settings.json";
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AppSettings {
+    #[serde(default)]
+    pub remote_endpoint: Option<crate::coordinator::RemoteEndpoint>,
     #[serde(default = "default_mode")]
     pub mode: String,
     #[serde(default = "default_conflict")]
@@ -46,6 +48,7 @@ fn default_ignore() -> String {
 impl Default for AppSettings {
     fn default() -> Self {
         AppSettings {
+            remote_endpoint: None,
             mode: default_mode(),
             conflict_policy: default_conflict(),
             use_hash: false,
@@ -82,7 +85,19 @@ pub fn save(app: &AppHandle, settings: &AppSettings) -> Result<(), String> {
     if let Some(parent) = path.parent() {
         fs::create_dir_all(parent).map_err(|e| format!("创建配置目录失败: {e}"))?;
     }
-    let data = serde_json::to_string_pretty(settings)
-        .map_err(|e| format!("序列化配置失败: {e}"))?;
+    let data =
+        serde_json::to_string_pretty(settings).map_err(|e| format!("序列化配置失败: {e}"))?;
     fs::write(&path, data).map_err(|e| format!("写入配置失败: {e}"))
+}
+
+#[cfg(test)]
+mod tests {
+    #[test]
+    fn old_settings_keep_filesystem_mode_and_preferences() {
+        let s:super::AppSettings=serde_json::from_str(r#"{"mode":"twoway","localPath":"/a","remotePath":"/b","useHash":true,"ignoreText":".git"}"#).unwrap();
+        assert!(s.remote_endpoint.is_none());
+        assert_eq!(s.mode, "twoway");
+        assert_eq!(s.remote_path, "/b");
+        assert!(s.use_hash);
+    }
 }

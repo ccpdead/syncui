@@ -1145,3 +1145,23 @@ body {
     height: 2px;
   }
 }
+
+/* SSH connection controls follow the existing desktop palette. */
+.endpoint-switch{display:flex;align-items:center;gap:16px;padding:10px 20px;color:var(--muted,#9ca3af);font-size:13px}
+.endpoint-switch select{margin-left:8px}.ssh-panel{min-width:0;flex:1;border:1px solid #303743;border-radius:12px;padding:16px;background:#171c24}
+.ssh-heading{display:flex;justify-content:space-between;gap:12px;margin-bottom:12px}.ssh-heading span,.ssh-fingerprint{color:#9ca3af;font-size:12px;overflow-wrap:anywhere}
+.ssh-fields{display:grid;grid-template-columns:repeat(2,minmax(0,1fr));gap:10px;border:0;padding:0;margin:0}.ssh-fields label{display:flex;flex-direction:column;gap:5px;font-size:12px;color:#b9c3d0}.ssh-fields input,.ssh-fields select{width:100%;min-width:0;box-sizing:border-box}.ssh-fields .ssh-check{flex-direction:row;align-items:center}.ssh-check input{width:auto}.ssh-root{grid-column:1/-1}
+.ssh-actions{display:flex;gap:8px;flex-wrap:wrap;margin-top:12px}.ssh-actions button{font-size:12px}.ssh-message{white-space:pre-wrap;overflow-wrap:anywhere;font-size:12px;color:#e8c67b;margin-bottom:0}
+.ssh-modal-backdrop{position:fixed;inset:0;background:#000a;z-index:1100;display:flex;align-items:center;justify-content:center;padding:24px}.ssh-modal{background:#171c24;border:1px solid #465367;border-radius:14px;padding:22px;max-width:640px;width:100%;max-height:85vh;overflow:auto}.ssh-modal h3{margin-top:0}.ssh-modal input{width:100%;box-sizing:border-box}.ssh-prompt{white-space:pre-wrap;overflow-wrap:anywhere;font-size:13px;line-height:1.6}.ssh-directory-list{display:flex;flex-direction:column;max-height:45vh;overflow:auto;margin-top:12px;gap:4px}.ssh-directory-list button{text-align:left;padding:8px;background:#202735;border:1px solid #344154;color:#dbe4ee;border-radius:5px}
+@media(max-width:950px){.zones:has(.ssh-panel){flex-wrap:wrap}.zones:has(.ssh-panel)>.ssh-panel{flex-basis:100%}.zones:has(.ssh-panel)>.arrow{display:none}}
+
+/* Keep connection setup usable at the minimum desktop window size. */
+.app:has(.ssh-panel) { overflow-y: auto; }
+.app:has(.ssh-panel) > .zones, .app:has(.ssh-panel) > .controls { flex-shrink: 0; }
+.app:has(.ssh-panel) .result { min-height: 260px; }
+.ssh-fields input:not([type="checkbox"]), .ssh-fields select, .endpoint-switch select, .ssh-modal input {
+  background: var(--panel-2); color: var(--text); border: 1px solid var(--border);
+  padding: 7px 9px; border-radius: 7px; font: inherit;
+}
+.ssh-fields input:focus, .ssh-fields select:focus { outline: 1px solid var(--accent); }
+.ssh-summary { overflow-wrap: anywhere; line-height: 1.6; color: var(--muted); font-size: 12px; }

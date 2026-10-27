@@ -1,3 +1,4 @@
+import { isTauri } from "@tauri-apps/api/core";
 import { useEffect, useMemo, useRef, useState, useCallback, forwardRef } from "react";
 import { getCurrentWebview } from "@tauri-apps/api/webview";
 import { listen } from "@tauri-apps/api/event";
@@ -18,7 +19,9 @@ import {
   Op,
   SyncMode,
   ConflictPolicy,
+  RemoteEndpoint,
 } from "./api";
+import SshConnection, { SshAuthDialog } from "./SshConnection";
 import DiffDrawer from "./DiffDrawer";
 import SelectionTree from "./SelectionTree";
 import IgnoreRules from "./IgnoreRules";
@@ -94,8 +97,8 @@ function entryToOp(e: DiffEntry, policy: ConflictPolicy): Op | null {
     case "deleteRemote":
       return "delRemote";
     case "conflict":
-      if (policy === "local") return "upload";
-      if (policy === "remote") return "download";
+      if (policy === "local") return e.localSize == null ? "delRemote" : "upload";
+      if (policy === "remote") return e.remoteSize == null ? "delLocal" : "download";
       if (policy === "skip") return null;
       // "newer"
       return (e.localMtime ?? 0) >= (e.remoteMtime ?? 0) ? "upload" : "download";
@@ -107,6 +110,11 @@ function entryToOp(e: DiffEntry, policy: ConflictPolicy): Op | null {
 export default function App() {
   const [localPath, setLocalPath] = useState("");
   const [remotePath, setRemotePath] = useState("");
+  const [sshEndpoint, setSshEndpoint] = useState<Extract<RemoteEndpoint,{kind:"ssh"}>>({kind:"ssh",profileId:"",path:""});
+  const [remoteKind, setRemoteKind] = useState<"filesystem"|"ssh">("filesystem");
+  const [sshReady, setSshReady] = useState(false);
+  const remoteEndpoint = useMemo<RemoteEndpoint>(() => remoteKind === "ssh" ? sshEndpoint : {kind:"filesystem",path:remotePath}, [remoteKind, sshEndpoint, remotePath]);
+  const effectiveRemotePath = remoteEndpoint.path;
   const [mode, setMode] = useState<SyncMode>("mirror");
   const [conflictPolicy, setConflictPolicy] = useState<ConflictPolicy>("newer");
   const [useHash, setUseHash] = useState(false);
@@ -178,6 +186,7 @@ export default function App() {
         }
         if (s.localPath) setLocalPath(s.localPath);
         if (s.remotePath) setRemotePath(s.remotePath);
+        if (s.remoteEndpoint?.kind === "ssh") { setSshEndpoint(s.remoteEndpoint); setRemoteKind("ssh"); }
       })
       .catch(() => {
         /* keep defaults */
@@ -202,6 +211,7 @@ export default function App() {
         ignoreText,
         localPath,
         remotePath,
+        remoteEndpoint,
       }).catch(() => {
         /* ignore write errors in UI */
       });
@@ -216,7 +226,10 @@ export default function App() {
     ignoreText,
     localPath,
     remotePath,
+    remoteEndpoint,
   ]);
+
+  useEffect(() => { setResult(null); setSelected(new Set()); setDiffEntry(null); }, [localPath, remoteEndpoint, mode, useHash, ignoreText, sshReady]);
 
   const isTwoway = mode === "twoway";
   const isMirrorPull = mode === "mirror_pull";
@@ -252,8 +265,10 @@ export default function App() {
 
   useEffect(() => {
     let unlisten: (() => void) | undefined;
+    if (!isTauri()) return;
     getCurrentWebview()
       .onDragDropEvent((event) => {
+        if (comparing || syncing) return;
         const p = event.payload;
         if (p.type === "over") {
           setDragOver(sideAtPosition(p.position.x, p.position.y));
@@ -262,7 +277,7 @@ export default function App() {
           setDragOver(null);
           if (side && p.paths.length > 0) {
             if (side === "local") setLocalPath(p.paths[0]);
-            else setRemotePath(p.paths[0]);
+            else if (remoteKind === "filesystem") setRemotePath(p.paths[0]);
           }
         } else {
           setDragOver(null);
@@ -272,9 +287,10 @@ export default function App() {
     return () => {
       if (unlisten) unlisten();
     };
-  }, [sideAtPosition]);
+  }, [sideAtPosition, comparing, syncing, remoteKind]);
 
   useEffect(() => {
+    if (!isTauri()) return;
     let disposed = false;
     let unlistenSync: (() => void) | undefined;
     let unlistenScan: (() => void) | undefined;
@@ -373,7 +389,7 @@ export default function App() {
 
   const runCompare = async (reason: "manual" | "after-sync" = "manual") => {
     setError(null);
-    if (!localPath || !remotePath) {
+    if (!localPath || !effectiveRemotePath || (remoteKind === "ssh" && !sshReady)) {
       setError("请先指定本地目录和远程/挂载目录。");
       return;
     }
@@ -387,11 +403,11 @@ export default function App() {
     const compareStarted = performance.now();
     pushLog(`[诊断/前端] 开始${reason === "after-sync" ? "同步后自动" : "手动"}对比：mode=${mode} hash=${useHash}，忽略规则=${ignoreList.length}项`);
     try {
-      const res = await compareDirs(localPath, remotePath, {
+      const res = await compareDirs(localPath, effectiveRemotePath, {
         useHash,
         ignore: ignoreList,
         mode,
-      });
+      }, remoteEndpoint);
       pushLog(`[诊断/前端] 对比命令往返：${(performance.now() - compareStarted).toFixed(2)}ms（含后台排队/扫描/哈希/结果传输）`);
       resultAtRef.current = performance.now();
       setResult(res);
@@ -497,7 +513,7 @@ export default function App() {
   );
 
   const runSync = async () => {
-    if (!result) return;
+    if (!result?.comparisonId) { setError("比较结果已失效，请重新对比后同步。"); return; }
     const items = changedEntries
       .filter((e) => selected.has(e.relPath))
       .map((e) => ({ relPath: e.relPath, op: entryToOp(e, conflictPolicy) }))
@@ -520,42 +536,28 @@ export default function App() {
     pushLog(`开始同步：${items.length} 项，正在统计传输速度…`);
     pushLog(`[诊断/前端] 任务预估：复制=${copyItems.length}项，预计=${plannedBytes} B，平均文件=${Math.round(plannedBytes / Math.max(1, copyItems.length))} B，workers=${concurrency}，hash=${useHash}`);
     try {
-      const res = await syncEntries(localPath, remotePath, items, ignoreList, concurrency, mode);
+      const res = await syncEntries(result.comparisonId, [...selected], conflictPolicy, concurrency);
       const commandMs = performance.now() - syncStarted;
-      pushLog(`[诊断/前端] 同步命令往返=${commandMs.toFixed(2)}ms；文件操作=${(res.elapsedSeconds * 1000).toFixed(2)}ms；其余=${Math.max(0, commandMs - res.elapsedSeconds * 1000).toFixed(2)}ms（含快照/排队/通信/诊断等）`);
+      pushLog(`[诊断/前端] 同步命令往返=${commandMs.toFixed(2)}ms；文件操作=${(res.elapsedSeconds * 1000).toFixed(2)}ms；其余=${Math.max(0, commandMs - res.elapsedSeconds * 1000).toFixed(2)}ms（含结果刷新/排队/通信/诊断等）`);
       const averageSpeed = res.elapsedSeconds > 0 ? res.bytesCopied / res.elapsedSeconds : 0;
       setTransfer({
         bytesCopied: res.bytesCopied,
         bytesPerSecond: averageSpeed,
         elapsedSeconds: res.elapsedSeconds,
         finished: true,
+        logicalBytes: res.logicalBytes,
       });
       const summary =
         `↑${res.uploaded} ↓${res.downloaded} 删远程${res.deletedRemote} ` +
         `删本地${res.deletedLocal} 跳过${res.skipped} 失败${res.failed}，` +
         `已传输 ${formatTransferAmount(res.bytesCopied)}，平均速度 ${formatTransferAmount(averageSpeed)}/s`;
-      if (res.cancelled) {
-        // Skip the (possibly very slow) full re-compare: drop what was done.
-        pushLog(`同步已取消（${res.donePaths.length}/${items.length} 项已完成）：${summary}`);
-        const done = new Set(res.donePaths);
-        setResult((prev) => {
-          if (!prev) return prev;
-          const kept = prev.entries.filter((e) => !done.has(e.relPath));
-          // Copies leave both sides identical; deletions leave nothing behind.
-          const nowSame = prev.entries.filter(
-            (e) => done.has(e.relPath) && DIFFABLE.has(e.action)
-          ).length;
-          return recount(kept, prev.skippedCount, prev.sameCount + nowSame);
-        });
-        setSelected((prev) => new Set([...prev].filter((r) => !done.has(r))));
-        setDiffEntry((d) => (d && done.has(d.relPath) ? null : d));
-      } else {
-        pushLog(`同步结束：${summary}`);
-        const recompareStarted = performance.now();
-        await runCompare("after-sync");
-        pushLog(`[诊断/前端] 同步后重新对比：${(performance.now() - recompareStarted).toFixed(2)}ms`);
-      }
+      pushLog(`同步结束：${summary}，文件完成量 ${formatTransferAmount(res.logicalBytes)}`);
+      if (res.refreshed) { resultAtRef.current = performance.now(); setResult(res.refreshed); setSelected(new Set()); setDiffEntry(null); }
+      else { setResult(null); setSelected(new Set()); setDiffEntry(null); }
+      if (res.needsRecompare || res.cancelled) pushLog("任务部分完成或结果变化，请重新对比。");
+      for (const message of res.errors) pushLog(message);
     } catch (e) {
+      setResult(null); setSelected(new Set()); setDiffEntry(null);
       setError(String(e));
     } finally {
       setSyncing(false);
@@ -565,7 +567,7 @@ export default function App() {
         finished: true,
         bytesPerSecond: prev.elapsedSeconds > 0 ? prev.bytesCopied / prev.elapsedSeconds : 0,
       } : prev);
-      pushLog(`[诊断/前端] 同步流程整体耗时：${(performance.now() - syncStarted).toFixed(2)}ms（文件操作 + 快照重建/保存 + 自动重新对比）`);
+      pushLog(`[诊断/前端] 同步流程整体耗时：${(performance.now() - syncStarted).toFixed(2)}ms（文件操作 + 单次扫描刷新 + 基线保存）`);
     }
   };
 
@@ -613,9 +615,12 @@ export default function App() {
         </div>
       </header>
 
+      <SshAuthDialog />
+      <div className="endpoint-switch"><label>远端连接方式 <select disabled={comparing||syncing} value={remoteKind} onChange={e=>{setRemoteKind(e.target.value as "filesystem"|"ssh");setSshReady(false);}}><option value="filesystem">本地 / 挂载目录</option><option value="ssh">SSH 服务器</option></select></label>{remoteKind==="ssh"&&<span>远端直接扫描 · rsync 批量传输</span>}</div>
       <section className="zones">
         <DropZone
           ref={localRef}
+          disabled={comparing || syncing}
           title="本地目录"
           hint="拖入文件夹，或点击浏览"
           path={localPath}
@@ -624,21 +629,22 @@ export default function App() {
           onClear={() => setLocalPath("")}
         />
         <div className="arrow">{arrowGlyph}</div>
-        <DropZone
+        {remoteKind === "ssh" ? <SshConnection endpoint={sshEndpoint} onChange={setSshEndpoint} onReady={setSshReady} disabled={comparing||syncing}/> : <DropZone
           ref={remoteRef}
+          disabled={comparing || syncing}
           title="远程 / 挂载目录"
           hint="sftp / smb / nfs 挂载点也可"
           path={remotePath}
           active={dragOver === "remote"}
           onBrowse={() => browse("remote")}
           onClear={() => setRemotePath("")}
-        />
+        />}
       </section>
 
       <section className="controls">
         <label className="opt">
           模式
-          <select value={mode} onChange={(e) => setMode(e.target.value as SyncMode)}>
+          <select disabled={comparing||syncing} value={mode} onChange={(e) => setMode(e.target.value as SyncMode)}>
             <option value="mirror">镜像（本地→远程）</option>
             <option value="mirror_pull">镜像（远程→本地）</option>
             <option value="twoway">双向（三方对比）</option>
@@ -648,7 +654,7 @@ export default function App() {
           冲突
           <select
             value={conflictPolicy}
-            disabled={!isTwoway}
+            disabled={!isTwoway||comparing||syncing}
             onChange={(e) => setConflictPolicy(e.target.value as ConflictPolicy)}
           >
             <option value="newer">较新优先</option>
@@ -661,6 +667,8 @@ export default function App() {
           并发
           <input
             type="number"
+            disabled={remoteKind==="ssh" || comparing || syncing}
+            title={remoteKind==="ssh" ? "SSH 模式使用单批次流水传输" : "同步线程数"}
             min={1}
             max={32}
             value={concurrency}
@@ -668,7 +676,7 @@ export default function App() {
           />
         </label>
         <label className="opt">
-          <input type="checkbox" checked={useHash} onChange={(e) => setUseHash(e.target.checked)} />
+          <input type="checkbox" disabled={comparing||syncing} checked={useHash} onChange={(e) => setUseHash(e.target.checked)} />
           哈希校验
         </label>
         <IgnoreRules
@@ -681,7 +689,7 @@ export default function App() {
             setDiffEntry(null);
           }}
         />
-        <button className="btn primary" onClick={() => void runCompare()} disabled={comparing || syncing}>
+        <button className="btn primary" onClick={() => void runCompare()} disabled={comparing || syncing || (remoteKind==="ssh" && !sshReady)}>
           {comparing ? "对比中…" : "对比 Compare"}
         </button>
       </section>
@@ -781,7 +789,7 @@ export default function App() {
             <button
               className="btn primary"
               onClick={runSync}
-              disabled={syncing || selectedCount === 0}
+              disabled={syncing || comparing || selectedCount === 0 || !result.comparisonId}
             >
               {syncing ? "同步中…" : `同步选中 (${selectedCount})`}
             </button>
@@ -840,10 +848,12 @@ export default function App() {
                   embedded
                   entry={diffEntry}
                   localRoot={localPath}
-                  remoteRoot={remotePath}
+                  remoteRoot={effectiveRemotePath}
+                  remoteEndpoint={remoteEndpoint}
+                  disabled={syncing||comparing}
                   options={{ useHash, ignore: ignoreList, mode }}
                   onClose={() => setDiffEntry(null)}
-                  onEntryUpdated={(updated) => applyEntryUpdate(diffEntry.relPath, updated)}
+                  onEntryUpdated={(updated) => { applyEntryUpdate(diffEntry.relPath, updated); pushLog("文件已保存，请重新对比后再同步。"); }}
                 />
               ) : (
                 <div className="diff-placeholder">
@@ -864,7 +874,8 @@ export default function App() {
                 {transfer.finished ? "平均同步速度" : "当前同步速度"}
                 <strong>{formatTransferAmount(transfer.bytesPerSecond)}/s</strong>
               </span>
-              <span>已传输 {formatTransferAmount(transfer.bytesCopied)}</span>
+              <span title={remoteKind==="ssh" ? "统计 SSH 加密前的双向协议字节，不含 SSH 封装" : "实际复制的文件字节"}>已传输 {formatTransferAmount(transfer.bytesCopied)}</span>
+              {transfer.logicalBytes != null && <span>文件处理量 {formatTransferAmount(transfer.logicalBytes)}</span>}
             </div>
           )}
           {log.map((l, i) => (
@@ -933,10 +944,11 @@ const DropZone = forwardRef<
     hint: string;
     path: string;
     active: boolean;
+    disabled: boolean;
     onBrowse: () => void;
     onClear: () => void;
   }
->(({ title, hint, path, active, onBrowse, onClear }, ref) => {
+>(({ title, hint, path, active, disabled, onBrowse, onClear }, ref) => {
   return (
     <div ref={ref} className={`zone ${active ? "active" : ""} ${path ? "filled" : ""}`}>
       <div className="zone-title">{title}</div>
@@ -946,10 +958,10 @@ const DropZone = forwardRef<
             {path}
           </div>
           <div className="zone-actions">
-            <button className="link" onClick={onBrowse}>
+            <button className="link" disabled={disabled} onClick={onBrowse}>
               更换
             </button>
-            <button className="link" onClick={onClear}>
+            <button className="link" disabled={disabled} onClick={onClear}>
               清除
             </button>
           </div>
@@ -957,7 +969,7 @@ const DropZone = forwardRef<
       ) : (
         <>
           <div className="zone-hint">{hint}</div>
-          <button className="btn" onClick={onBrowse}>
+          <button className="btn" disabled={disabled} onClick={onBrowse}>
             浏览…
           </button>
         </>

@@ -1,6 +1,6 @@
 # SyncUI
 
-> 跨平台目录对比与同步桌面应用 · Tauri v2 + React + Rust
+> Linux 目录对比与同步桌面应用 · Tauri v2 + React + Rust
 
 [![Tauri](https://img.shields.io/badge/Tauri-v2-blue?logo=tauri)](https://tauri.app/)
 [![React](https://img.shields.io/badge/React-18-61DAFB?logo=react)](https://react.dev/)
@@ -10,8 +10,10 @@
 把本地目录和远程/挂载目录拖进窗口，对比差异，勾选后一键同步。无需手敲 `rsync`，
 也不用复制粘贴时逐个点"覆盖/跳过"。
 
-挂载后的远程目录（sftp、smb、nfs 等）对程序而言就是普通文件系统路径——引擎只操作两个路径，
-不关心底层协议。
+0.2 新增 Linux SSH 模式：远端 Agent 本地扫描，rsync 经 SSH 批量传输，支持密码/密钥认证、系统密钥环、一键部署、精确删除和远端文本编辑。原有挂载模式继续可用。
+
+- [SSH 使用、部署与开发说明](docs/SSH使用与部署.md)
+- [0.2 测试与性能报告](docs/SSH测试报告.md)
 
 ---
 
@@ -186,8 +188,8 @@ Linux 产出 `.deb` 和 `.AppImage`：
 
 ```text
 src-tauri/target/release/bundle/
-├── deb/    ← syncui_0.1.0_amd64.deb（包名 syncui）
-└── appimage/  ← syncui_0.1.0_amd64.AppImage
+├── deb/    ← syncui_0.2.0_amd64.deb（包名 syncui）
+└── appimage/  ← syncui_0.2.0_amd64.AppImage
 ```
 
 安装 `.deb`。包名必须是 `syncui`，不能是 `sync-ui`：后者是 Ubuntu 官方 SyncEvolution 的图形界面（中文名"同步"），
@@ -237,7 +239,7 @@ chmod +x src-tauri/target/release/bundle/appimage/syncui_*.AppImage
 
 6. 点击「同步选中 (n)」执行，进度条和日志实时更新
 
-7. 同步完成后自动重新对比，确认结果
+7. 同步后两端各扫描一次，共用清单完成验证、基线合并和界面刷新
 ```
 
 ---
@@ -331,9 +333,9 @@ cargo test
 
 **Q: 同步速度低，应该提供哪些日志？**
 
-重新启动更新后的应用，执行一次对比，再同步少量有代表性的文件。复制从“开始同步”到“同步流程整体耗时”的日志，或提供日志中列出的 `sync-*.log` 和同步后生成的 `compare-*.log`。Linux 默认目录为 `~/.config/com.syncui.app/diagnostics/`。
+重新启动更新后的应用，执行一次对比，再同步少量有代表性的文件。提供日志中列出的 `ssh-connect-*.log`、`compare-*.log` 和 `sync-*.log`。同步后的刷新记录在同一份同步日志中。Linux 默认目录为 `~/.config/com.syncui.app/diagnostics/`。
 
-- `文件操作` 是上传/下载/删除执行的实际等待时间；`同步流程整体耗时` 还包括快照重建、保存和自动重新对比。不要仅凭几 KB 小文件的 KB/s 判断网络带宽。
+- `文件操作` 是上传/下载/删除执行的实际等待时间；`同步整体结束 wall` 还包括单轮刷新和基线保存。不要仅凭几 KB 小文件的 KB/s 判断网络带宽。
 - `read/write/close` 分别是读、写和成功复制后关闭文件的累计耗时；`exists/mkdir/open/metadata/create/chmod/mtime/rename` 用于定位挂载文件系统的固定操作开销。
 - `fallback` 表示重命名失败后再次复制，已包含在读写等分段中，不能重复相加；`rename_error`、`mtime_error` 会保留失败原因。并发线程耗时也不能直接相加当作任务实际等待时间。
 - 不超过 20 项的小批量同步逐项显示耗时；大批量只在界面保留有限进度和最慢项，完整逐文件记录保存在诊断文件中。

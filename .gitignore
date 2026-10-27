@@ -3,3 +3,7 @@ dist/
 src-tauri/target/
 *.log
 .DS_Store
+
+crates/*/target/
+src-tauri/resources/agents/*/
+src-tauri/resources/syncui-bridge

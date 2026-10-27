@@ -2914,6 +2914,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "sync-core"
+version = "0.2.0"
+dependencies = [
+ "blake3",
+ "filetime",
+ "serde",
+ "serde_json",
+ "walkdir",
+]
+
+[[package]]
 name = "sync_wrapper"
 version = "1.0.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -2924,12 +2935,15 @@ dependencies = [
 
 [[package]]
 name = "syncui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "blake3",
  "filetime",
+ "libc",
  "serde",
  "serde_json",
+ "sha2",
+ "sync-core",
  "tauri",
  "tauri-build",
  "tauri-plugin-dialog",

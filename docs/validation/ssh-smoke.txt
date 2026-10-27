@@ -1,0 +1,135 @@
+Isolated SSH fixture: /tmp/syncui-smoke-WmXfER
+   Compiling syncui v0.2.0 (/home/ccpdead/00-program/01-LLM/syncui/src-tauri)
+    Finished `dev` profile [unoptimized + debuginfo] target(s) in 3.76s
+     Running `src-tauri/target/debug/examples/ssh_smoke`
+[诊断 ssh-connect-1793065916599-44415-0 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 ssh-connect-1793065916599-44415-0 +0.1ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/ssh-connect-1793065916599-44415-0.log
+[诊断 ssh-connect-1793065916599-44415-0 +150.8ms] SSH 认证完成：elapsed=150.73ms
+[诊断 ssh-connect-1793065916599-44415-0 +252.0ms] 远端环境/Agent 检测完成：elapsed=251.89ms
+PASS: SSH authentication, host-key confirmation, deployment, version checks
+[诊断 compare-1793065917020-44415-1 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 compare-1793065917020-44415-1 +0.0ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/compare-1793065917020-44415-1.log
+[诊断 compare-1793065917020-44415-1 +26.3ms] 清单接收/解析完成：wall=26.23ms（含远端启动与传输），SSH 操作均访问远端真实目录
+[诊断 compare-1793065917020-44415-1 +26.4ms] 扫描完成：local=6 files 0.11ms；remote=1 files 0.10ms；两侧并行
+[诊断 compare-1793065917020-44415-1 +26.5ms] 哈希候选=0；哈希/差异决策=0.04ms
+[诊断 compare-1793065917020-44415-1 +26.5ms] 对比完成：wall=26.44ms complete=true
+[诊断 sync-1793065917046-44415-2 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 sync-1793065917046-44415-2 +0.0ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/sync-1793065917046-44415-2.log
+[诊断 sync-1793065917046-44415-2 +0.1ms] comparison_id=4ce79010e4498c36ef566bd1632f47c6 selected=6 endpoint=Ssh { profile_id: "isolated-smoke", path: "/tmp/syncui-smoke-WmXfER/remote" }
+[诊断 sync-1793065917046-44415-2 +205.1ms] rsync upload：files=5 protocol_bytes=738（SSH 加密前双向协议数据）
+[诊断 sync-1793065917046-44415-2 +205.1ms] rsync exit=Some(0) elapsed=0.151s logical_bytes=85
+[诊断 sync-1793065917046-44415-2 +205.1ms] 阶段 upload：items=5 elapsed=153.30ms
+[诊断 sync-1793065917046-44415-2 +410.4ms] rsync download：files=1 protocol_bytes=357（SSH 加密前双向协议数据）
+[诊断 sync-1793065917046-44415-2 +410.5ms] rsync exit=Some(0) elapsed=0.151s logical_bytes=11
+[诊断 sync-1793065917046-44415-2 +410.5ms] 阶段 download：items=1 elapsed=153.24ms
+[诊断 sync-1793065917046-44415-2 +437.1ms] 同步后刷新：两端各扫描一次，共用清单进行验证、基线更新和界面刷新
+[诊断 sync-1793065917046-44415-2 +463.6ms] 清单接收/解析完成：wall=26.40ms（含远端启动与传输），SSH 操作均访问远端真实目录
+[诊断 sync-1793065917046-44415-2 +463.6ms] 扫描完成：local=7 files 0.13ms；remote=6 files 0.12ms；两侧并行
+[诊断 sync-1793065917046-44415-2 +463.7ms] 哈希候选=0；哈希/差异决策=0.04ms
+[诊断 sync-1793065917046-44415-2 +463.8ms] 基线合并保存：files=6 elapsed=0.13ms
+[诊断 sync-1793065917046-44415-2 +463.9ms] 同步整体结束：wall=0.46s transfer_phase=0.44s uploaded=5 downloaded=1 failed=0 needs_recompare=false bytes=1095 logical_bytes=96
+PASS: bidirectional rsync, exact selection, special filenames, byte accounting, single refresh
+PASS: remote text read/write and stale version protection
+[诊断 compare-1793065917674-44415-3 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 compare-1793065917674-44415-3 +0.1ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/compare-1793065917674-44415-3.log
+[诊断 compare-1793065917674-44415-3 +26.0ms] 清单接收/解析完成：wall=25.89ms（含远端启动与传输），SSH 操作均访问远端真实目录
+[诊断 compare-1793065917674-44415-3 +26.0ms] 扫描完成：local=7 files 0.10ms；remote=5 files 0.08ms；两侧并行
+[诊断 compare-1793065917674-44415-3 +26.1ms] 哈希候选=0；哈希/差异决策=0.04ms
+[诊断 compare-1793065917674-44415-3 +26.2ms] 对比完成：wall=26.12ms complete=true
+[诊断 sync-1793065917700-44415-4 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 sync-1793065917700-44415-4 +0.0ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/sync-1793065917700-44415-4.log
+[诊断 sync-1793065917700-44415-4 +0.0ms] comparison_id=09c47e318ca4c849c1cad55a4dbbbea7 selected=1 endpoint=Ssh { profile_id: "isolated-smoke", path: "/tmp/syncui-smoke-WmXfER/remote" }
+[诊断 sync-1793065917700-44415-4 +51.5ms] 阶段 delete：items=1 elapsed=0.07ms
+[诊断 sync-1793065917700-44415-4 +77.5ms] 同步后刷新：两端各扫描一次，共用清单进行验证、基线更新和界面刷新
+[诊断 sync-1793065917700-44415-4 +103.5ms] 清单接收/解析完成：wall=25.94ms（含远端启动与传输），SSH 操作均访问远端真实目录
+[诊断 sync-1793065917700-44415-4 +103.5ms] 扫描完成：local=6 files 0.12ms；remote=5 files 0.09ms；两侧并行
+[诊断 sync-1793065917700-44415-4 +103.6ms] 哈希候选=0；哈希/差异决策=0.03ms
+[诊断 sync-1793065917700-44415-4 +103.7ms] 基线合并保存：files=5 elapsed=0.13ms
+[诊断 sync-1793065917700-44415-4 +103.8ms] 同步整体结束：wall=0.10s transfer_phase=0.08s uploaded=0 downloaded=0 failed=0 needs_recompare=false bytes=0 logical_bytes=0
+PASS: three-way deletion and baseline preservation
+[诊断 compare-1793065917804-44415-5 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 compare-1793065917804-44415-5 +0.0ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/compare-1793065917804-44415-5.log
+[诊断 compare-1793065917804-44415-5 +25.5ms] 清单接收/解析完成：wall=25.48ms（含远端启动与传输），SSH 操作均访问远端真实目录
+[诊断 compare-1793065917804-44415-5 +25.6ms] 扫描完成：local=6 files 0.08ms；remote=5 files 0.08ms；两侧并行
+[诊断 compare-1793065917804-44415-5 +25.7ms] 哈希候选=0；哈希/差异决策=0.02ms
+[诊断 compare-1793065917804-44415-5 +25.7ms] 对比完成：wall=25.66ms complete=true
+[诊断 sync-1793065917830-44415-6 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 sync-1793065917830-44415-6 +0.0ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/sync-1793065917830-44415-6.log
+[诊断 sync-1793065917830-44415-6 +0.0ms] comparison_id=e7b1b23dcfdf173ab535ce5e96b106da selected=1 endpoint=Ssh { profile_id: "isolated-smoke", path: "/tmp/syncui-smoke-WmXfER/remote" }
+[诊断 sync-1793065917830-44415-6 +25.4ms] 同步后刷新：两端各扫描一次，共用清单进行验证、基线更新和界面刷新
+[诊断 sync-1793065917830-44415-6 +50.8ms] 清单接收/解析完成：wall=25.34ms（含远端启动与传输），SSH 操作均访问远端真实目录
+[诊断 sync-1793065917830-44415-6 +50.9ms] 扫描完成：local=6 files 0.09ms；remote=5 files 0.08ms；两侧并行
+[诊断 sync-1793065917830-44415-6 +50.9ms] 哈希候选=0；哈希/差异决策=0.02ms
+[诊断 sync-1793065917830-44415-6 +51.0ms] 基线合并保存：files=5 elapsed=0.11ms
+[诊断 sync-1793065917830-44415-6 +51.1ms] 同步整体结束：wall=0.05s transfer_phase=0.03s uploaded=0 downloaded=0 failed=0 needs_recompare=true bytes=0 logical_bytes=0
+PASS: stale comparison cannot overwrite files
+[诊断 compare-1793065917991-44415-7 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 compare-1793065917991-44415-7 +0.1ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/compare-1793065917991-44415-7.log
+[诊断 compare-1793065917991-44415-7 +26.8ms] 清单接收/解析完成：wall=26.66ms（含远端启动与传输），SSH 操作均访问远端真实目录
+[诊断 compare-1793065917991-44415-7 +26.8ms] 扫描完成：local=7 files 0.11ms；remote=5 files 0.12ms；两侧并行
+[诊断 compare-1793065917991-44415-7 +27.0ms] 哈希候选=0；哈希/差异决策=0.06ms
+[诊断 compare-1793065917991-44415-7 +27.1ms] 对比完成：wall=27.05ms complete=true
+[诊断 sync-1793065918018-44415-8 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 sync-1793065918018-44415-8 +0.0ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/sync-1793065918018-44415-8.log
+[诊断 sync-1793065918018-44415-8 +0.1ms] comparison_id=a2ab0ce90b1072df2ea23e70d4b0040b selected=1 endpoint=Ssh { profile_id: "isolated-smoke", path: "/tmp/syncui-smoke-WmXfER/remote" }
+[诊断 sync-1793065918018-44415-8 +306.4ms] rsync upload：files=1 protocol_bytes=16781587（SSH 加密前双向协议数据）
+[诊断 sync-1793065918018-44415-8 +306.5ms] rsync exit=Some(0) elapsed=0.251s logical_bytes=16777216
+[诊断 sync-1793065918018-44415-8 +306.5ms] 阶段 upload：items=1 elapsed=253.86ms
+[诊断 sync-1793065918018-44415-8 +333.2ms] 同步后刷新：两端各扫描一次，共用清单进行验证、基线更新和界面刷新
+[诊断 sync-1793065918018-44415-8 +359.8ms] 清单接收/解析完成：wall=26.58ms（含远端启动与传输），SSH 操作均访问远端真实目录
+[诊断 sync-1793065918018-44415-8 +359.8ms] 扫描完成：local=7 files 0.10ms；remote=6 files 0.13ms；两侧并行
+[诊断 sync-1793065918018-44415-8 +360.0ms] 哈希候选=0；哈希/差异决策=0.07ms
+[诊断 sync-1793065918018-44415-8 +360.2ms] 基线合并保存：files=6 elapsed=0.16ms
+[诊断 sync-1793065918018-44415-8 +360.2ms] 同步整体结束：wall=0.36s transfer_phase=0.33s uploaded=1 downloaded=0 failed=0 needs_recompare=false bytes=16781587 logical_bytes=16777216
+[诊断 compare-1793065918394-44415-9 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 compare-1793065918394-44415-9 +0.1ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/compare-1793065918394-44415-9.log
+[诊断 compare-1793065918394-44415-9 +26.6ms] 清单接收/解析完成：wall=26.50ms（含远端启动与传输），SSH 操作均访问远端真实目录
+[诊断 compare-1793065918394-44415-9 +26.6ms] 扫描完成：local=7 files 0.11ms；remote=6 files 0.09ms；两侧并行
+[诊断 compare-1793065918394-44415-9 +26.8ms] 哈希候选=0；哈希/差异决策=0.04ms
+[诊断 compare-1793065918394-44415-9 +26.8ms] 对比完成：wall=26.73ms complete=true
+[诊断 sync-1793065918421-44415-10 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 sync-1793065918421-44415-10 +0.0ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/sync-1793065918421-44415-10.log
+[诊断 sync-1793065918421-44415-10 +0.0ms] comparison_id=d242f82556643aff426c369cd76ff2e0 selected=1 endpoint=Ssh { profile_id: "isolated-smoke", path: "/tmp/syncui-smoke-WmXfER/remote" }
+[诊断 sync-1793065918421-44415-10 +204.5ms] rsync upload：files=1 protocol_bytes=45329（SSH 加密前双向协议数据）
+[诊断 sync-1793065918421-44415-10 +204.6ms] rsync exit=Some(0) elapsed=0.151s logical_bytes=16777216
+[诊断 sync-1793065918421-44415-10 +204.6ms] 阶段 upload：items=1 elapsed=153.22ms
+[诊断 sync-1793065918421-44415-10 +230.8ms] 同步后刷新：两端各扫描一次，共用清单进行验证、基线更新和界面刷新
+[诊断 sync-1793065918421-44415-10 +256.5ms] 清单接收/解析完成：wall=25.66ms（含远端启动与传输），SSH 操作均访问远端真实目录
+[诊断 sync-1793065918421-44415-10 +256.6ms] 扫描完成：local=7 files 0.09ms；remote=6 files 0.09ms；两侧并行
+[诊断 sync-1793065918421-44415-10 +256.6ms] 哈希候选=0；哈希/差异决策=0.04ms
+[诊断 sync-1793065918421-44415-10 +256.8ms] 基线合并保存：files=6 elapsed=0.16ms
+[诊断 sync-1793065918421-44415-10 +256.8ms] 同步整体结束：wall=0.26s transfer_phase=0.23s uploaded=1 downloaded=0 failed=0 needs_recompare=false bytes=45329 logical_bytes=16777216
+PASS: delta reuse: full=16781587 protocol bytes, delta=45329 protocol bytes, logical=16777216 bytes
+BENCH round=1 order=local,ssh first_ms=34.00 second_ms=80.46 remote_scan_ms=51.27
+BENCH round=2 order=ssh,local first_ms=68.84 second_ms=39.75 remote_scan_ms=55.50
+BENCH round=3 order=local,ssh first_ms=34.46 second_ms=79.82 remote_scan_ms=51.31
+PASS: 10000-file local/SSH manifest parity over three rounds
+[诊断 compare-1793065919227-44415-11 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 compare-1793065919227-44415-11 +0.1ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/compare-1793065919227-44415-11.log
+[诊断 compare-1793065919227-44415-11 +26.8ms] 清单接收/解析完成：wall=26.71ms（含远端启动与传输），SSH 操作均访问远端真实目录
+[诊断 compare-1793065919227-44415-11 +26.9ms] 扫描完成：local=8 files 0.51ms；remote=6 files 0.12ms；两侧并行
+[诊断 compare-1793065919227-44415-11 +27.0ms] 哈希候选=0；哈希/差异决策=0.05ms
+[诊断 compare-1793065919227-44415-11 +27.1ms] 对比完成：wall=26.99ms complete=true
+[诊断 sync-1793065919255-44415-12 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 sync-1793065919255-44415-12 +0.0ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/sync-1793065919255-44415-12.log
+[诊断 sync-1793065919255-44415-12 +0.1ms] comparison_id=d6fd272ba72dc4198b74b0adc08020ea selected=1 endpoint=Ssh { profile_id: "isolated-smoke", path: "/tmp/syncui-smoke-WmXfER/remote" }
+[诊断 sync-1793065919255-44415-12 +908.4ms] rsync upload：files=1 protocol_bytes=164121（SSH 加密前双向协议数据）
+[诊断 sync-1793065919255-44415-12 +908.5ms] 阶段 upload：items=1 elapsed=856.67ms
+[诊断 sync-1793065919255-44415-12 +908.5ms] 任务部分完成或取消：保留旧基线，剩余结果需要重新对比
+[诊断 sync-1793065919255-44415-12 +908.6ms] 同步整体结束：wall=0.91s transfer_phase=0.91s uploaded=0 downloaded=0 failed=0 needs_recompare=true bytes=164121 logical_bytes=0
+PASS: in-flight rsync cancellation leaves no partial final file and preserves baseline
+[诊断 ssh-connect-1793065920163-44415-13 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 ssh-connect-1793065920163-44415-13 +0.0ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/ssh-connect-1793065920163-44415-13.log
+[诊断 ssh-connect-1793065920163-44415-13 +203.9ms] SSH 认证完成：elapsed=203.84ms
+[诊断 ssh-connect-1793065920163-44415-13 +305.0ms] 远端环境/Agent 检测完成：elapsed=304.93ms
+PASS: encrypted private key unlock through askpass UI event bridge
+[诊断 ssh-connect-1793065920468-44415-14 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 ssh-connect-1793065920468-44415-14 +0.0ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/ssh-connect-1793065920468-44415-14.log
+[诊断 ssh-connect-1793065920468-44415-14 +100.9ms] SSH 认证完成：elapsed=100.80ms
+[诊断 ssh-connect-1793065920468-44415-14 +202.1ms] 远端环境/Agent 检测完成：elapsed=202.07ms
+PASS: wrong password recovery and password authentication through OpenSSH askpass
+PASS: interrupted agent protocol cannot produce a complete manifest
+[诊断 ssh-connect-1793065920778-44415-15 +0.0ms] 任务开始：版本=0.2.0，系统=linux/x86_64，构建=debug
+[诊断 ssh-connect-1793065920778-44415-15 +0.1ms] 完整诊断文件：/tmp/syncui-smoke-WmXfER/config/com.syncui.smoke/diagnostics/ssh-connect-1793065920778-44415-15.log
+PASS: changed known host key is blocked without replacement
+ALL SSH SMOKE CHECKS PASSED
