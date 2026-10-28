@@ -1,7 +1,7 @@
 //! SSH askpass and rsync remote-shell bridge. Secrets travel over a private Unix socket.
 use std::{
     io::{self, BufRead, Read, Write},
-    os::unix::net::UnixStream,
+    os::{fd::AsRawFd, unix::net::UnixStream},
     process::Stdio,
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -102,31 +102,13 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
     let n = count.clone();
     std::thread::spawn(move || {
         let mut src = io::stdin();
-        let mut b = [0; 65536];
-        loop {
-            match src.read(&mut b) {
-                Ok(0) | Err(_) => break,
-                Ok(k) => {
-                    if input.write_all(&b[..k]).is_err() {
-                        break;
-                    }
-                    n.fetch_add(k as u64, Ordering::Relaxed);
-                }
-            }
+        if let Err(e) = relay(&mut src, &mut input, &n) {
+            eprintln!("syncui bridge: rsync -> ssh: {e}");
         }
     });
     let mut output = child.stdout.take().unwrap();
-    let mut dst = io::stdout();
-    let mut buf = [0; 65536];
-    loop {
-        let k = output.read(&mut buf)?;
-        if k == 0 {
-            break;
-        }
-        dst.write_all(&buf[..k])?;
-        dst.flush()?;
-        count.fetch_add(k as u64, Ordering::Relaxed);
-    }
+    let mut dst = io::stdout().lock();
+    relay(&mut output, &mut dst, &count).map_err(|e| format!("ssh -> rsync: {e}"))?;
     let status = child.wait()?;
     stop.store(true, Ordering::Relaxed);
     let _ = report.join();
@@ -134,4 +116,100 @@ fn run() -> Result<(), Box<dyn std::error::Error>> {
         return Err(format!("ssh exited: {status}").into());
     }
     Ok(())
+}
+
+fn relay<R: Read + AsRawFd, W: Write + AsRawFd>(
+    src: &mut R,
+    dst: &mut W,
+    count: &AtomicU64,
+) -> io::Result<()> {
+    let mut buf = [0; 65536];
+    loop {
+        let len = retry_io(src.as_raw_fd(), libc::POLLIN, || src.read(&mut buf))?;
+        if len == 0 {
+            return Ok(());
+        }
+        let mut offset = 0;
+        while offset < len {
+            let written = retry_io(dst.as_raw_fd(), libc::POLLOUT, || {
+                dst.write(&buf[offset..len])
+            })?;
+            if written == 0 {
+                return Err(io::ErrorKind::WriteZero.into());
+            }
+            offset += written;
+            count.fetch_add(written as u64, Ordering::Relaxed);
+        }
+        retry_io(dst.as_raw_fd(), libc::POLLOUT, || dst.flush())?;
+    }
+}
+
+fn retry_io<T>(
+    fd: libc::c_int,
+    events: libc::c_short,
+    mut operation: impl FnMut() -> io::Result<T>,
+) -> io::Result<T> {
+    loop {
+        match operation() {
+            Err(e) if e.kind() == io::ErrorKind::Interrupted => continue,
+            Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
+                // rsync can pass a nonblocking stdout. Wait instead of dropping data or spinning.
+                let mut pollfd = libc::pollfd {
+                    fd,
+                    events,
+                    revents: 0,
+                };
+                while unsafe { libc::poll(&mut pollfd, 1, -1) } < 0 {
+                    let error = io::Error::last_os_error();
+                    if error.kind() != io::ErrorKind::Interrupted {
+                        return Err(error);
+                    }
+                }
+            }
+            result => return result,
+        }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn nonblocking_relay_preserves_bytes_under_backpressure() {
+        let (mut source, mut producer) = UnixStream::pair().unwrap();
+        let (mut destination, mut consumer) = UnixStream::pair().unwrap();
+        source.set_nonblocking(true).unwrap();
+        destination.set_nonblocking(true).unwrap();
+        let expected: Vec<u8> = (0..4 * 1024 * 1024).map(|i| (i % 251) as u8).collect();
+        let payload = expected.clone();
+        let writer = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(20));
+            producer.write_all(&payload).unwrap();
+        });
+        let reader = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(100));
+            let mut received = Vec::new();
+            consumer.read_to_end(&mut received).unwrap();
+            received
+        });
+        let count = AtomicU64::new(0);
+        relay(&mut source, &mut destination, &count).unwrap();
+        drop(destination);
+        writer.join().unwrap();
+        assert_eq!(reader.join().unwrap(), expected);
+        assert_eq!(count.load(Ordering::Relaxed), expected.len() as u64);
+    }
+
+    #[test]
+    fn relay_reports_closed_destination() {
+        let (mut source, mut producer) = UnixStream::pair().unwrap();
+        let (mut destination, consumer) = UnixStream::pair().unwrap();
+        destination.set_nonblocking(true).unwrap();
+        drop(consumer);
+        producer.write_all(b"data").unwrap();
+        drop(producer);
+        let error = relay(&mut source, &mut destination, &AtomicU64::new(0)).unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::BrokenPipe);
+    }
 }

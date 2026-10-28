@@ -450,6 +450,7 @@ fn rsync_batch(
     let destination = format!("syncui-peer:{}/", remote.trim_end_matches('/'));
     let mut cmd = ssh::system_command("rsync");
     cmd.args([
+        "--blocking-io",
         "--times",
         "--perms",
         "--relative",
@@ -539,20 +540,32 @@ fn rsync_batch(
                 batch_started.elapsed().as_secs_f64(),
                 logical.get()
             ));
-            log.detail(String::from_utf8_lossy(&out.stdout));
-            if !out.success {
-                return Err(format!(
-                    "rsync 部分失败，结果需要重新对比: {}",
-                    out.stderr.trim()
-                ));
-            }
-            if !out.stderr.trim().is_empty() {
-                log.detail(out.stderr)
-            }
+            check_rsync_output(&out, log)?;
             Ok(bytes)
         }
-        Err(e) => Err(e),
+        Err(e) => {
+            log.log(format!("rsync 执行失败或取消：{e}"));
+            Err(e)
+        }
     }
+}
+
+fn check_rsync_output(out: &ssh::Output, log: &Diagnostics) -> Result<(), String> {
+    log.detail(String::from_utf8_lossy(&out.stdout));
+    // Persist stderr before returning: failed transfers need it most.
+    if !out.stderr.trim().is_empty() {
+        log.detail(format!("rsync stderr:\n{}", out.stderr));
+    }
+    if !out.success {
+        let error = format!(
+            "rsync 部分失败（退出码={}），结果需要重新对比: {}",
+            out.code.map(|c| c.to_string()).unwrap_or_else(|| "无，进程被信号终止".into()),
+            if out.stderr.trim().is_empty() { "未提供错误输出" } else { out.stderr.trim() }
+        );
+        log.log(&error);
+        return Err(error);
+    }
+    Ok(())
 }
 fn sync_impl(
     app: &AppHandle,
@@ -924,6 +937,9 @@ fn sync_impl(
             finished: true,
         },
     );
+    for error in &result.errors {
+        log.detail(format!("同步错误：{error}"));
+    }
     log.log(format!("同步整体结束：wall={:.2}s transfer_phase={:.2}s uploaded={} downloaded={} failed={} needs_recompare={} bytes={} logical_bytes={}",started.elapsed().as_secs_f64(),result.elapsed_seconds,result.uploaded,result.downloaded,result.failed,result.needs_recompare,result.bytes_copied,result.logical_bytes));
     Ok(result)
 }
@@ -1066,6 +1082,29 @@ pub fn write(
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn failed_rsync_persists_stderr_before_returning() {
+        let dir = std::env::temp_dir().join(format!("syncui-rsync-log-{}", ssh::random_id()));
+        for code in [Some(12), None] {
+            let log = Diagnostics::new("rsync-test", Some(&dir), |_| {});
+            let out = ssh::Output {
+                code,
+                stdout: b"partial transfer progress".to_vec(),
+                stderr: "rsync: connection unexpectedly closed\nrsync error: protocol data stream\n".into(),
+                success: false,
+            };
+            let error = check_rsync_output(&out, &log).unwrap_err();
+            assert!(error.contains("connection unexpectedly closed"));
+            assert!(error.contains(if code.is_some() { "退出码=12" } else { "进程被信号终止" }));
+            // Must be flushed and readable even while the diagnostics object is alive.
+            let saved = std::fs::read_to_string(dir.join(format!("{}.log", log.id()))).unwrap();
+            assert!(saved.contains(&out.stderr));
+            assert!(saved.contains("partial transfer progress"));
+            assert!(saved.contains(&error));
+        }
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
     #[test]
     fn conflict_resolution_honors_deleted_side() {
         let e = crate::engine::DiffEntry {

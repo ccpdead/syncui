@@ -2935,7 +2935,7 @@ dependencies = [
 
 [[package]]
 name = "syncui"
-version = "0.2.3"
+version = "0.2.5"
 dependencies = [
  "blake3",
  "filetime",

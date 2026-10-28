@@ -5,7 +5,7 @@
 # GUI (universe/sync-ui), and unattended-upgrades would replace our 0.1.0
 # with their 2.0.0-3 overnight.
 name = "syncui"
-version = "0.2.3"
+version = "0.2.5"
 description = "Cross-platform directory sync GUI"
 authors = ["you"]
 edition = "2021"

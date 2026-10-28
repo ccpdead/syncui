@@ -230,7 +230,15 @@ export default function App() {
     remoteEndpoint,
   ]);
 
-  useEffect(() => { setResult(null); setSelected(new Set()); setDiffEntry(null); }, [localPath, remoteEndpoint, mode, useHash, ignoreText, sshReady]);
+  useEffect(() => { setResult(null); setSelected(new Set()); setDiffEntry(null); }, [localPath, remoteEndpoint, mode, useHash, ignoreText]);
+
+  // A disconnected endpoint invalidates the plan, but its last diff remains useful.
+  useEffect(() => {
+    if (remoteKind === "ssh" && !sshReady) {
+      setResult((prev) => prev ? { ...prev, comparisonId: null } : null);
+      setDiffEntry(null);
+    }
+  }, [remoteKind, sshReady]);
 
   const isTwoway = mode === "twoway";
   const isMirrorPull = mode === "mirror_pull";
@@ -515,6 +523,7 @@ export default function App() {
 
   const runSync = async () => {
     if (!result?.comparisonId) { setError("比较结果已失效，请重新对比后同步。"); return; }
+    const comparisonId = result.comparisonId;
     const items = changedEntries
       .filter((e) => selected.has(e.relPath))
       .map((e) => ({ relPath: e.relPath, op: entryToOp(e, conflictPolicy) }))
@@ -525,6 +534,8 @@ export default function App() {
     }
     setError(null);
     setSyncing(true);
+    // The backend consumes this plan even when synchronization fails.
+    setResult((prev) => prev ? { ...prev, comparisonId: null } : null);
     setCancelling(false);
     setProgress(null);
     setTransfer({ bytesCopied: 0, bytesPerSecond: 0, elapsedSeconds: 0, finished: false });
@@ -537,7 +548,7 @@ export default function App() {
     pushLog(`开始同步：${items.length} 项，正在统计传输速度…`);
     pushLog(`[诊断/前端] 任务预估：复制=${copyItems.length}项，预计=${plannedBytes} B，平均文件=${Math.round(plannedBytes / Math.max(1, copyItems.length))} B，workers=${concurrency}，hash=${useHash}`);
     try {
-      const res = await syncEntries(result.comparisonId, [...selected], conflictPolicy, concurrency);
+      const res = await syncEntries(comparisonId, [...selected], conflictPolicy, concurrency);
       const commandMs = performance.now() - syncStarted;
       pushLog(`[诊断/前端] 同步命令往返=${commandMs.toFixed(2)}ms；文件操作=${(res.elapsedSeconds * 1000).toFixed(2)}ms；其余=${Math.max(0, commandMs - res.elapsedSeconds * 1000).toFixed(2)}ms（含结果刷新/排队/通信/诊断等）`);
       const averageSpeed = res.elapsedSeconds > 0 ? res.bytesCopied / res.elapsedSeconds : 0;
@@ -553,13 +564,29 @@ export default function App() {
         `删本地${res.deletedLocal} 跳过${res.skipped} 失败${res.failed}，` +
         `已传输 ${formatTransferAmount(res.bytesCopied)}，平均速度 ${formatTransferAmount(averageSpeed)}/s`;
       pushLog(`同步结束：${summary}，文件完成量 ${formatTransferAmount(res.logicalBytes)}`);
-      if (res.refreshed) { resultAtRef.current = performance.now(); setResult(res.refreshed); setSelected(new Set()); setDiffEntry(null); }
-      else { setResult(null); setSelected(new Set()); setDiffEntry(null); }
-      if (res.needsRecompare || res.cancelled) pushLog("任务部分完成或结果变化，请重新对比。");
+      const needsRecompare = res.needsRecompare || res.cancelled || res.failed > 0 || !res.refreshed;
+      if (needsRecompare) {
+        setResult((prev) => {
+          const latest = res.refreshed ?? prev;
+          return latest ? { ...latest, comparisonId: null } : null;
+        });
+        const message = res.cancelled
+          ? "同步已取消，部分文件可能已完成。请重新对比后再同步。"
+          : "同步未全部完成或结果刷新失败。请重新对比后再同步。";
+        setError(message + (res.errors.length ? ` ${res.errors[0]}` : ""));
+        pushLog(message);
+      } else {
+        resultAtRef.current = performance.now();
+        setResult(res.refreshed!);
+        setSelected(new Set());
+      }
+      setDiffEntry(null);
       for (const message of res.errors) pushLog(message);
     } catch (e) {
-      setResult(null); setSelected(new Set()); setDiffEntry(null);
-      setError(String(e));
+      setResult((prev) => prev ? { ...prev, comparisonId: null } : null);
+      setDiffEntry(null);
+      setError(`同步未完成，请重新对比后再同步。${String(e)}`);
+      pushLog(`同步失败：${String(e)}`);
     } finally {
       setSyncing(false);
       setCancelling(false);
@@ -696,6 +723,11 @@ export default function App() {
       </section>
 
       {error && <div className="error">{error}</div>}
+      {result && !result.comparisonId && !syncing && (
+        <div className="error" role="status">
+          需要重新对比：当前差异列表仅供参考，部分文件可能已变化，不能继续使用此结果同步。
+        </div>
+      )}
 
       {comparing && (
         <div className="scanning">
